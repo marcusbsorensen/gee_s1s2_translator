@@ -1,0 +1,223 @@
+# Operational v1 configuration for the GEE port of the v2 lowland heath
+# fire mapping pipeline. Mirrors config/example_mpc_augmented_1.yaml in the
+# v2 PyTorch project, with three blocks added for GEE specifics:
+#
+#   sentinel1.source: gee_grd_calibrated   (was: planetary_computer)
+#   calibration:                            (new) S1 calibration recipe
+#   export:                                 (new) GCS bucket and TFRecord layout
+#
+# AOIs, date windows, target/inference, max_aoi_cloud_cover_percent, n_patches
+# budgets, force_split, and exclude_windows are byte-for-byte the same as v2.
+#
+# When Sonia takes this operational under her own Google account, the only
+# values she should need to change are the project field below and the values
+# in .env. The AOIs themselves can be edited freely as more sites come into
+# scope.
+
+project:
+  name: "Lowland heath S1-to-S2 translation, GEE operational v1"
+  workspace: ./local_cache       # tiny working directory; nothing important here
+  random_seed: 42
+
+aois:
+  # =========================================================================
+  # TARGET AOIs (inference only, the actual fire perimeters)
+  # =========================================================================
+  - name: "Brentmoor Heath fire perimeter"
+    role: target
+    source:
+      type: kml
+      path: ../s1s2-translator/inputs/SWT_MappedFires_20220911.kml
+      filter: { field: Site, equals: "Brentmoor Heath" }
+    buffer_metres: 200
+
+  - name: "Poors Allotment fire perimeter"
+    role: target
+    source:
+      type: kml
+      path: ../s1s2-translator/inputs/SWT_MappedFires_20220911.kml
+      filter: { field: Site, equals: "Poors Allotment" }
+    buffer_metres: 200
+
+  # =========================================================================
+  # TBH TRAINING AOIs (original three, retained)
+  # =========================================================================
+  - name: "TBH SPA training area"
+    role: training
+    source:
+      type: kml
+      path: ../s1s2-translator/inputs/TBH_SPA_Surrey_400m_Buffer_Dissolved.kml
+    sample:
+      strategy: random_patches
+      n_patches: 50
+      patch_size_pixels: 256
+      resolution_metres: 10
+
+  - name: "Brentmoor area training"
+    role: training
+    source:
+      type: kml
+      path: ../s1s2-translator/inputs/SWT_MappedFires_20220911.kml
+      filter: { field: Site, equals: "Brentmoor Heath" }
+    buffer_metres: 2500
+    sample:
+      strategy: random_patches
+      n_patches: 30
+      patch_size_pixels: 256
+      resolution_metres: 10
+
+  - name: "Poors Allotment area training"
+    role: training
+    source:
+      type: kml
+      path: ../s1s2-translator/inputs/SWT_MappedFires_20220911.kml
+      filter: { field: Site, equals: "Poors Allotment" }
+    buffer_metres: 2500
+    sample:
+      strategy: random_patches
+      n_patches: 30
+      patch_size_pixels: 256
+      resolution_metres: 10
+
+  # =========================================================================
+  # SURREY TRAINING AOIs (outside TBH SPA, similar geology)
+  # Hankley Common excludes 2022 due to the July 2022 wildfire.
+  # =========================================================================
+  - name: "Thursley Common"
+    role: training
+    source: { type: point_buffer, latitude: 51.158, longitude: -0.689, buffer_metres: 2000 }
+    sample: { strategy: random_patches, n_patches: 40, patch_size_pixels: 256, resolution_metres: 10 }
+
+  - name: "Frensham Common"
+    role: training
+    source: { type: point_buffer, latitude: 51.165, longitude: -0.789, buffer_metres: 2000 }
+    sample: { strategy: random_patches, n_patches: 40, patch_size_pixels: 256, resolution_metres: 10 }
+
+  - name: "Hankley Common"
+    role: training
+    source: { type: point_buffer, latitude: 51.180, longitude: -0.730, buffer_metres: 2000 }
+    exclude_windows: ["pre-fire 2022"]
+    sample: { strategy: random_patches, n_patches: 40, patch_size_pixels: 256, resolution_metres: 10 }
+
+  # =========================================================================
+  # NEW FOREST TRAINING AOIs
+  # =========================================================================
+  - name: "Beaulieu Heath"
+    role: training
+    source: { type: point_buffer, latitude: 50.815, longitude: -1.450, buffer_metres: 2000 }
+    sample: { strategy: random_patches, n_patches: 40, patch_size_pixels: 256, resolution_metres: 10 }
+
+  - name: "Matley Heath"
+    role: training
+    source: { type: point_buffer, latitude: 50.871, longitude: -1.524, buffer_metres: 1500 }
+    sample: { strategy: random_patches, n_patches: 30, patch_size_pixels: 256, resolution_metres: 10 }
+
+  - name: "Ibsley Common"
+    role: training
+    source: { type: point_buffer, latitude: 50.890, longitude: -1.770, buffer_metres: 2000 }
+    sample: { strategy: random_patches, n_patches: 40, patch_size_pixels: 256, resolution_metres: 10 }
+
+  # =========================================================================
+  # DORSET HEATHS TRAINING AOIs
+  # =========================================================================
+  - name: "Hartland Moor"
+    role: training
+    source: { type: point_buffer, latitude: 50.665, longitude: -2.046, buffer_metres: 1500 }
+    sample: { strategy: random_patches, n_patches: 30, patch_size_pixels: 256, resolution_metres: 10 }
+
+  - name: "Studland and Godlingston Heath"
+    role: training
+    source: { type: point_buffer, latitude: 50.655, longitude: -1.961, buffer_metres: 2000 }
+    sample: { strategy: random_patches, n_patches: 40, patch_size_pixels: 256, resolution_metres: 10 }
+
+  - name: "Holton Heath"
+    role: training
+    source: { type: point_buffer, latitude: 50.715, longitude: -2.087, buffer_metres: 1500 }
+    sample: { strategy: random_patches, n_patches: 30, patch_size_pixels: 256, resolution_metres: 10 }
+
+  # =========================================================================
+  # HELD-OUT TEST AOI (never seen during training)
+  # =========================================================================
+  - name: "Ashdown Forest"
+    role: training
+    source: { type: point_buffer, latitude: 51.065, longitude: 0.031, buffer_metres: 2500 }
+    force_split: test
+    sample: { strategy: random_patches, n_patches: 50, patch_size_pixels: 256, resolution_metres: 10 }
+
+  # =========================================================================
+  # SANITY-CHECK INFERENCE AOI (cloud-free, ground truth available)
+  # =========================================================================
+  - name: "Hankley Common sanity check"
+    role: target
+    source: { type: point_buffer, latitude: 51.180, longitude: -0.730, buffer_metres: 1000 }
+
+date_windows:
+  - { start: "2021-04-01", end: "2021-09-30", label: "pre-fire 2021" }
+  - { start: "2022-04-01", end: "2022-08-15", label: "pre-fire 2022" }
+  - { start: "2023-04-01", end: "2023-09-30", label: "comparison 2023" }
+  - { start: "2024-04-01", end: "2024-09-30", label: "comparison 2024" }
+  - { start: "2022-08-20", end: "2022-11-30", label: "post-fire 2022", role: inference }
+  - { start: "2024-06-01", end: "2024-08-31", label: "sanity check 2024", role: inference }
+
+sentinel2:
+  source: gee_sr_harmonized
+  product: L2A
+  collection_id: COPERNICUS/S2_SR_HARMONIZED
+  max_aoi_cloud_cover_percent: 8
+  bands: [B02, B03, B04, B08, B11, B12]
+  derived_indices: [NDVI, NBR, NDWI]
+  resolution_metres: 10
+
+sentinel1:
+  source: gee_grd_calibrated
+  collection_id: COPERNICUS/S1_GRD
+  polarisations: [VV, VH]
+  orbit: any
+  resolution_metres: 10
+
+# GEE-specific: the calibration pipeline applied to raw GRD before pairing.
+# Recipe follows Mullissa et al. 2021 and adugnag/gee_s1_ard. See
+# docs/calibration_methodology.md for the rationale and validation results.
+calibration:
+  thermal_noise_removal: true
+  border_noise_correction: true
+  radiometric_target: gamma_naught       # gamma_naught | sigma_naught
+  terrain_correction: true
+  terrain_dem: USGS/SRTMGL1_003          # SRTM 30 m
+  speckle_filter:
+    enabled: true
+    method: lee
+    window: 5
+  output: dB                              # dB | linear
+
+pairing:
+  max_temporal_separation_days: 3
+  prefer_same_orbit: true
+  require_same_relative_orbit: false
+
+storage:
+  format: tfrecord                        # tfrecord | geotiff
+  patch_size_pixels: 256
+  patch_overlap_pixels: 128               # min spacing for random_patches sampler
+  manifest_path: manifest.csv             # relative to gs://<bucket>/<prefix>/operational_v1/
+
+# Where exports go on GCS. Combined with .env's GCS_BUCKET and GCS_PREFIX:
+#   gs://<GCS_BUCKET>/<GCS_PREFIX>/operational_v1/patches/<split>/<aoi_slug>/<pair_id>.tfrecord
+export:
+  patches_subprefix: patches              # bucket://<prefix>/operational_v1/patches/...
+  shards_per_aoi_window: auto             # auto | <int>; "auto" sizes shards by patch count
+  max_concurrent_tasks: 4                 # GEE export tasks running concurrently
+  poll_interval_seconds: 30
+
+# Splits and patch budgets are honoured per (AOI, window). Same logic as v2.
+training_split:
+  validation_split: 0.2
+  test_split: 0.1
+
+inference:
+  output_subprefix: predictions           # bucket://<prefix>/operational_v1/predictions/...
+  derive_indices_from_predicted_reflectance: true
+  apply_to:
+    - { aoi: "Brentmoor Heath fire perimeter", date_window: "post-fire 2022" }
+    - { aoi: "Poors Allotment fire perimeter", date_window: "post-fire 2022" }
+    - { aoi: "Hankley Common sanity check", date_window: "sanity check 2024" }

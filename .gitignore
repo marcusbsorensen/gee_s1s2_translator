@@ -1,0 +1,37 @@
+# Environment
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Notebook
+.ipynb_checkpoints/
+
+# Local artefacts (everything substantive lives in GCS for this project).
+local_cache/
+*.tif
+*.tiff
+*.tfrecord
+*.gz
+
+# Per-machine resumable-harvest state (task IDs are user-specific).
+.gee_s1s2_harvest_state.json
+
+# Service account JSONs - never commit
+*-key.json
+service-account*.json
