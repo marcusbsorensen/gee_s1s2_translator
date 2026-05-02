@@ -1,0 +1,78 @@
+{
+  "_about": "v2 PyTorch + MPC reference results. Used by 02_unet_training.ipynb's Cell 10 to render a side-by-side comparison vs the GEE-port training run. All numbers extracted from ../s1s2-translator/data/runs/v2_diverse_heath/.",
+  "v2_run_id": "v2_diverse_heath",
+  "v2_trained_at": "20260429T114100Z",
+  "v2_config_hash": "07bc9e213f2048e6",
+  "data": {
+    "manifest_rows": 351,
+    "in_distribution_test_patches": 221,
+    "ashdown_held_out_test_patches": 76,
+    "group_distribution_pct": {
+      "surrey_tbh_area": 49.5,
+      "new_forest": 23.9,
+      "dorset_heaths": 15.5,
+      "ashdown_held_out": 11.2
+    }
+  },
+  "best_val_rmse": {
+    "unet": 0.1062,
+    "linear_baseline": 0.1144
+  },
+  "in_distribution_test_per_band_mae": {
+    "n_patches": 221,
+    "B02": 0.0181,
+    "B03": 0.0210,
+    "B04": 0.0271,
+    "B08": 0.0711,
+    "B11": 0.0510,
+    "B12": 0.0386
+  },
+  "ashdown_held_out_per_band_mae": {
+    "n_patches": 76,
+    "B02": 0.0218,
+    "B03": 0.0242,
+    "B04": 0.0273,
+    "B08": 0.0749,
+    "B11": 0.0442,
+    "B12": 0.0367
+  },
+  "ashdown_held_out_per_band_rmse": {
+    "n_patches": 76,
+    "B02": 0.0396,
+    "B03": 0.0414,
+    "B04": 0.0440,
+    "B08": 0.0984,
+    "B11": 0.0646,
+    "B12": 0.0544
+  },
+  "variance_retention_driver_bands_patch_specific_pct": {
+    "_about": "v2's central methodological refinement: pred-std / patch-truth-std, computed per Ashdown patch and averaged. Driver bands = B04, B08, B11, B12. Pass bracket = [75, 105]; below = collapse, above = noisy.",
+    "unet_mean_pct": 58.3,
+    "linear_baseline_mean_pct": 17.5,
+    "unet_vs_baseline_ratio": 3.33,
+    "verdict_unet": "FAIL (below 75% bracket; documented architectural limitation, but 3.3x baseline still establishes the U-Net's benefit)",
+    "verdict_baseline": "FAIL"
+  },
+  "tolerance_for_phase_2_comparison": {
+    "_about": "From the Phase 2 kickoff prompt: deviations beyond these brackets are stop-and-investigate.",
+    "val_rmse_pass_bracket": [0.085, 0.130],
+    "ashdown_variance_retention_pass_floor_pct": 40
+  },
+  "footnotes": [
+    {
+      "topic": "Ashdown held-out test set count",
+      "v2_count": 76,
+      "gee_port_count": 105,
+      "note": "GEE-port Ashdown produces 105 patches versus v2's 76 (+38 percent). Two compounding causes, neither a bug: (1) the GEE port's random-origin sampler with patch_overlap_pixels=128 fits more origins per scene in the 5 km Ashdown buffer than v2's deterministic grid; (2) GEE's COPERNICUS/S2_SR_HARMONIZED indexing yields slightly more candidate scenes than MPC's sentinel-2-l2a for the same windows. Phase 2 should compute Ashdown metrics on the full 105-patch test set and footnote the divergence in the comparison table; do not subsample to match v2. See docs/methodology_divergences.md section 2."
+    },
+    {
+      "topic": "S1 calibration offset",
+      "magnitude_db": -1.5,
+      "note": "GEE-calibrated gamma-naught runs ~1.5 dB below MPC RTC across all validation samples uniformly (Vollrath/Mullissa volumetric model vs ESA range-Doppler). Internally consistent for training; see docs/calibration_methodology.md and docs/methodology_divergences.md section 1."
+    },
+    {
+      "topic": "T30UWB partial-coverage handling",
+      "note": "10 None-cloud-check warnings on T30UWB tile, all for Beaulieu Heath which straddles the T30UWB/T30UXB MGRS boundary. Diagnostic confirms zero recoverable patches: each scene covers 3.5-25.1% of Beaulieu's bbox and has too few SCL pixels for even one 256x256 patch. New Forest's 20.5% share (vs v2's 23.9%) is meteorology + AOI-size variance, not a tile-boundary artefact. See docs/methodology_divergences.md section 3."
+    }
+  ]
+}

@@ -32,6 +32,9 @@ local_cache/
 # Per-machine resumable-harvest state (task IDs are user-specific).
 .gee_s1s2_harvest_state.json
 
+# Per-run harvest logs.
+harvest_*.log
+
 # Service account JSONs - never commit
 *-key.json
 service-account*.json
