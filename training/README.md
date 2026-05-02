@@ -12,14 +12,16 @@ project / bucket / run-name, then Run All.
 ## Opening the notebook in Colab
 
 1. **Open** `notebooks/02_unet_training.ipynb` in Colab.
-   - From GitHub: `https://colab.research.google.com/github/<your-fork>/gee_s1s2_translator/blob/main/training/notebooks/02_unet_training.ipynb`
+   - From GitHub: `https://colab.research.google.com/github/<owner>/gee_s1s2_translator/blob/main/training/notebooks/02_unet_training.ipynb` (replace `<owner>` with the GitHub account that hosts this fork).
    - Or upload the local `.ipynb` directly.
 2. **Set the runtime**: `Runtime → Change runtime type → Hardware accelerator → GPU`. The free-tier T4 is sufficient for this model and dataset; no Colab Pro needed for the v2-equivalent harvest size.
-3. **Edit Cell 2 (Parameters)** — these are the only edits required:
-   - `PROJECT_ID` — your GCP project ID
-   - `GCS_BUCKET` — the bucket Phase 1 harvested into
-   - `TRAINING_RUN_NAME` — a label for this run (becomes the GCS sub-prefix; re-running with a new label does not overwrite earlier runs)
-   - All other parameters have v2-matching defaults
+3. **Configure parameters** (Cell 2). Two equivalent approaches — pick one:
+   - **(a) Edit Cell 2 directly.** Change `PROJECT_ID = "your-gcp-project-id-here"` and `GCS_BUCKET = "your-bucket-name-here"` to your real values. `TRAINING_RUN_NAME` is a literal you change per run.
+   - **(b) Set environment variables** before running the notebook. Cell 2 reads from `os.environ` with placeholder defaults, so setting `GEE_S1S2_PROJECT_ID` and `GEE_S1S2_BUCKET` (and optionally `GEE_S1S2_PREFIX`) bypasses the need to edit the cell.
+     - In Colab: insert a prior cell with `import os; os.environ["GEE_S1S2_BUCKET"] = "..."; os.environ["GEE_S1S2_PROJECT_ID"] = "..."`.
+     - Locally: `export GEE_S1S2_BUCKET=...; export GEE_S1S2_PROJECT_ID=...` before `jupyter notebook`.
+   - Cell 2 fails fast with a clear `RuntimeError` if the placeholders are still in place when you Run all, so you can't accidentally run with the wrong target.
+   - Other Cell 2 parameters (`BATCH_SIZE`, `MAX_EPOCHS`, `LEARNING_RATE`, `EARLY_STOPPING_PATIENCE`, `RANDOM_SEED`, `S1_LEE_ALREADY_APPLIED_AT_HARVEST`) have v2-matching defaults; leave them alone unless you have a reason.
 4. **Run all cells** (`Runtime → Run all`). Colab will prompt for Google authentication when Cell 3 runs.
 5. **Wait** ~30–60 minutes (T4). The validation report is written to GCS in Cell 9 and a side-by-side vs v2 is printed in Cell 10.
 

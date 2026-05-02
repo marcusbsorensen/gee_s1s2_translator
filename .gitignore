@@ -1,6 +1,9 @@
-# Environment
+# Environment files (any .env / .env.local / .env.production / etc.)
 .env
+.env.*
+!.env.example
 .venv/
+.venv*/
 venv/
 
 # Python
@@ -35,6 +38,20 @@ local_cache/
 # Per-run harvest logs.
 harvest_*.log
 
-# Service account JSONs - never commit
+# Service-account JSONs and other credential files — never commit.
 *-key.json
 service-account*.json
+credentials.json
+client_secret*.json
+application_default_credentials.json
+gcloud-*.json
+# OAuth tokens, SSH keys, generic PEM/PKCS files.
+*.pem
+*.key
+!*.public.key
+*.crt
+oauth_token*
+.gcloud/
+# GEE / Earth Engine credential caches if they ever land in the tree.
+.earthengine/
+.config/earthengine/
