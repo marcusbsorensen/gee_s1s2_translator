@@ -98,13 +98,25 @@ class S1Stats:
     std: dict[str, float]     # per-band std (dB)
 
 
-def _peek_patches(uris: Iterable[str], n_max: int) -> list[dict[str, np.ndarray]]:
+def _band_feature_spec(hw: int = DEFAULT_PATCH_HW) -> dict:
+    """Per-band feature spec for the GEE-exported TFRecord format.
+
+    GEE's ``Export.image.toCloudStorage`` with ``patchDimensions=[H, W]``
+    writes each band as a flat ``tf.train.FloatList`` of ``H*W`` values
+    inside the Example proto. So the right spec is
+    ``FixedLenFeature([H*W], tf.float32)`` and we reshape after parsing.
+    """
+    return {b: tf.io.FixedLenFeature([hw * hw], tf.float32) for b in ALL_BANDS}
+
+
+def _peek_patches(uris: Iterable[str], n_max: int,
+                  hw: int = DEFAULT_PATCH_HW) -> list[dict[str, np.ndarray]]:
     """Read ``n_max`` patches without batching, return list of dicts."""
-    feature_spec = {b: tf.io.FixedLenFeature([], tf.string) for b in ALL_BANDS}
+    spec = _band_feature_spec(hw)
 
     def _decode(rec):
-        parsed = tf.io.parse_single_example(rec, feature_spec)
-        return {b: tf.io.parse_tensor(parsed[b], out_type=tf.float32) for b in ALL_BANDS}
+        parsed = tf.io.parse_single_example(rec, spec)
+        return {b: tf.reshape(parsed[b], [hw, hw]) for b in ALL_BANDS}
 
     out: list[dict[str, np.ndarray]] = []
     ds = tf.data.TFRecordDataset(list(uris), compression_type="GZIP").map(_decode)
@@ -172,25 +184,25 @@ def _lee_filter_5x5(x: tf.Tensor) -> tf.Tensor:
                                   padding="SAME")[0]
 
 
-def _build_decoder(stats: S1Stats, apply_lee: bool):
+def _build_decoder(stats: S1Stats, apply_lee: bool, hw: int = DEFAULT_PATCH_HW):
     s1_mean = tf.constant([stats.mean[b] for b in S1_BANDS], dtype=tf.float32)
     s1_std = tf.constant([stats.std[b] for b in S1_BANDS], dtype=tf.float32)
-    feature_spec = {b: tf.io.FixedLenFeature([], tf.string) for b in ALL_BANDS}
+    spec = _band_feature_spec(hw)
 
     def _decode(rec):
-        parsed = tf.io.parse_single_example(rec, feature_spec)
-        # Stack to (H, W, C) — S1 first, then S2, matching the export order.
+        parsed = tf.io.parse_single_example(rec, spec)
+        # Each band feature is a flat float32 list of length H*W from the
+        # GEE export; reshape to (H, W) and stack to (H, W, C). S1 first,
+        # then S2, matching stack_pair_image's export order.
         s1 = tf.stack(
-            [tf.io.parse_tensor(parsed[b], out_type=tf.float32) for b in S1_BANDS],
-            axis=-1,
+            [tf.reshape(parsed[b], [hw, hw]) for b in S1_BANDS], axis=-1,
         )
         s2 = tf.stack(
-            [tf.io.parse_tensor(parsed[b], out_type=tf.float32) for b in S2_BANDS],
-            axis=-1,
+            [tf.reshape(parsed[b], [hw, hw]) for b in S2_BANDS], axis=-1,
         )
         # Pin the spatial shape so downstream layers know it.
-        s1.set_shape([DEFAULT_PATCH_HW, DEFAULT_PATCH_HW, len(S1_BANDS)])
-        s2.set_shape([DEFAULT_PATCH_HW, DEFAULT_PATCH_HW, len(S2_BANDS)])
+        s1.set_shape([hw, hw, len(S1_BANDS)])
+        s2.set_shape([hw, hw, len(S2_BANDS)])
 
         # Replace any non-finite pixels with zero before normalisation.
         s1 = tf.where(tf.math.is_finite(s1), s1, tf.zeros_like(s1))
@@ -218,9 +230,10 @@ def build_dataset(
     apply_lee: bool = False,
     repeat: bool = False,
     seed: int = 42,
+    patch_hw: int = DEFAULT_PATCH_HW,
 ) -> tf.data.Dataset:
     """Build a ``tf.data.Dataset`` of (s1, s2) tensors from TFRecord URIs."""
-    decode = _build_decoder(stats, apply_lee=apply_lee)
+    decode = _build_decoder(stats, apply_lee=apply_lee, hw=patch_hw)
     ds = tf.data.TFRecordDataset(uris, compression_type="GZIP",
                                  num_parallel_reads=tf.data.AUTOTUNE)
     if shuffle:

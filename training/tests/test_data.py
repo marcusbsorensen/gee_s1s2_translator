@@ -20,10 +20,14 @@ from training.data import (
 
 
 def _make_tfrecord(path: Path, n_records: int = 2, hw: int = 32, seed: int = 0) -> None:
-    """Write a tiny gzipped TFRecord with ``n_records`` synthetic patches.
+    """Write a tiny gzipped TFRecord matching the GEE export format.
 
-    Patch size kept small (32x32 instead of 256x256) to keep test fast,
-    using ``set_shape``-aware build_dataset wiring works for any HxW.
+    GEE's ``Export.image.toCloudStorage`` with ``patchDimensions`` writes
+    each band as a flat ``tf.train.FloatList`` of ``H*W`` values directly
+    in the Example proto (NOT as a serialised tensor). We mirror that
+    format here so the tests exercise the real production decode path.
+
+    Patch size kept small (32x32 instead of 256x256) to keep tests fast.
     """
     rng = np.random.default_rng(seed)
     with tf.io.TFRecordWriter(str(path), options="GZIP") as w:
@@ -34,9 +38,8 @@ def _make_tfrecord(path: Path, n_records: int = 2, hw: int = 32, seed: int = 0) 
                     arr = rng.normal(loc=-12.0, scale=2.0, size=(hw, hw)).astype(np.float32)
                 else:
                     arr = rng.uniform(0.0, 1.0, size=(hw, hw)).astype(np.float32)
-                ser = tf.io.serialize_tensor(tf.constant(arr)).numpy()
                 features[b] = tf.train.Feature(
-                    bytes_list=tf.train.BytesList(value=[ser])
+                    float_list=tf.train.FloatList(value=arr.ravel().tolist())
                 )
             example = tf.train.Example(features=tf.train.Features(feature=features))
             w.write(example.SerializeToString())
@@ -114,31 +117,23 @@ def test_load_manifest_strips_wildcard_uris(tmp_path: Path) -> None:
 def test_build_dataset_shapes(synthetic_shard: Path) -> None:
     stats = S1Stats(mean={"VV": -10.0, "VH": -16.0},
                     std={"VV": 2.0, "VH": 2.0})
-    # The synthetic fixture has hw=32; the production hw=256 default is
-    # encoded via set_shape in the decoder. We override that one-off here
-    # by patching the constant for this test.
-    from training import data as data_mod
-    orig = data_mod.DEFAULT_PATCH_HW
-    data_mod.DEFAULT_PATCH_HW = 32
-    try:
-        ds = build_dataset([str(synthetic_shard)], stats=stats,
-                           batch_size=2, shuffle=False)
-        for s1, s2 in ds.take(1):
-            assert s1.shape == (2, 32, 32, 2)
-            assert s2.shape == (2, 32, 32, 6)
-            # Z-scored S1 should be centred near 0 (input mean was -12, stats mean -10/-16
-            # so the offsets are non-zero but the std should be order-unity).
-            assert tf.reduce_max(tf.abs(s1)).numpy() < 50.0
-            # S2 clipped to [0, 1].
-            assert float(tf.reduce_min(s2).numpy()) >= 0.0
-            assert float(tf.reduce_max(s2).numpy()) <= 1.0
-    finally:
-        data_mod.DEFAULT_PATCH_HW = orig
+    # The synthetic fixture has hw=32; the production hw=256 default
+    # is the build_dataset default. Override via the patch_hw kwarg.
+    ds = build_dataset([str(synthetic_shard)], stats=stats,
+                       batch_size=2, shuffle=False, patch_hw=32)
+    for s1, s2 in ds.take(1):
+        assert s1.shape == (2, 32, 32, 2)
+        assert s2.shape == (2, 32, 32, 6)
+        # Z-scored S1 should be centred near 0 (input mean was -12, stats mean -10/-16
+        # so the offsets are non-zero but the std should be order-unity).
+        assert tf.reduce_max(tf.abs(s1)).numpy() < 50.0
+        # S2 clipped to [0, 1].
+        assert float(tf.reduce_min(s2).numpy()) >= 0.0
+        assert float(tf.reduce_max(s2).numpy()) <= 1.0
 
 
 def test_dataset_replaces_nan_with_zero(tmp_path: Path) -> None:
     """A patch with NaN should not produce NaN tensors."""
-    from training import data as data_mod
     p = tmp_path / "withnan.tfrecord.gz"
     rng = np.random.default_rng(0)
     with tf.io.TFRecordWriter(str(p), options="GZIP") as w:
@@ -146,20 +141,14 @@ def test_dataset_replaces_nan_with_zero(tmp_path: Path) -> None:
         for b in ALL_BANDS:
             arr = rng.uniform(0.0, 1.0, size=(16, 16)).astype(np.float32)
             arr[0, 0] = np.nan
-            ser = tf.io.serialize_tensor(tf.constant(arr)).numpy()
             features[b] = tf.train.Feature(
-                bytes_list=tf.train.BytesList(value=[ser])
+                float_list=tf.train.FloatList(value=arr.ravel().tolist())
             )
         example = tf.train.Example(features=tf.train.Features(feature=features))
         w.write(example.SerializeToString())
 
     stats = S1Stats(mean={"VV": 0.0, "VH": 0.0}, std={"VV": 1.0, "VH": 1.0})
-    orig = data_mod.DEFAULT_PATCH_HW
-    data_mod.DEFAULT_PATCH_HW = 16
-    try:
-        ds = build_dataset([str(p)], stats=stats, batch_size=1, shuffle=False)
-        for s1, s2 in ds.take(1):
-            assert not bool(tf.reduce_any(tf.math.is_nan(s1)).numpy())
-            assert not bool(tf.reduce_any(tf.math.is_nan(s2)).numpy())
-    finally:
-        data_mod.DEFAULT_PATCH_HW = orig
+    ds = build_dataset([str(p)], stats=stats, batch_size=1, shuffle=False, patch_hw=16)
+    for s1, s2 in ds.take(1):
+        assert not bool(tf.reduce_any(tf.math.is_nan(s1)).numpy())
+        assert not bool(tf.reduce_any(tf.math.is_nan(s2)).numpy())
