@@ -47,8 +47,12 @@ from .linear_baseline import build_linear_baseline
 
 LOG = logging.getLogger("predict_aois")
 
-# Hardcoded targets per user spec (option A).
-TARGETS = [
+# Default targets — the three operational AOIs covered by the pre-existing
+# (cloud-free) harvest. Override via the ``GEE_S1S2_PREDICT_TARGETS_JSON``
+# env var (a JSON array of the same dict shape) to repurpose this entry
+# point for other AOI/date combinations, e.g. the post-fire 2022 cloud-
+# covered window once that harvest completes.
+DEFAULT_TARGETS = [
     {
         "aoi_slug": "brentmoor-area-training",
         "s1_date": "20230526",
@@ -262,7 +266,16 @@ def main() -> int:
     out_band_names = ["B02", "B03", "B04", "B08", "B11", "B12", "NDVI", "NBR", "NDWI"]
     hankley_summary = None
 
-    for tgt in TARGETS:
+    targets_json = os.environ.get("GEE_S1S2_PREDICT_TARGETS_JSON")
+    targets = json.loads(targets_json) if targets_json else DEFAULT_TARGETS
+    LOG.info("Predicting %d targets: %s", len(targets),
+             [t["out_label"] for t in targets])
+
+    output_subdir = os.environ.get("GEE_S1S2_PREDICT_OUTPUT_SUBDIR", "").strip("/")
+    if output_subdir:
+        LOG.info("Output sub-directory: %s/", output_subdir)
+
+    for tgt in targets:
         aoi = tgt["aoi_slug"]
         s1_date = tgt["s1_date"]
         label = tgt["out_label"]
@@ -299,7 +312,9 @@ def main() -> int:
                 full = _compute_indices(pred_chw)
                 patch_data.append((full, crs, transform))
             mosaic, mtrans, mcrs = _mosaic_patches(patch_data)
-            uri = f"{pred_root}/{model_label}/{label}_predicted_s2.tif"
+            uri = (f"{pred_root}/{model_label}/{output_subdir}/{label}_predicted_s2.tif"
+                   if output_subdir
+                   else f"{pred_root}/{model_label}/{label}_predicted_s2.tif")
             size = _write_geotiff(uri, mosaic, mtrans, mcrs, out_band_names)
             LOG.info("  wrote %s (%d B)", uri, size)
 
@@ -311,7 +326,9 @@ def main() -> int:
                 full_truth = _compute_indices(truth_chw)
                 patch_data.append((full_truth, crs, transform))
             truth_mosaic, t_trans, t_crs = _mosaic_patches(patch_data)
-            truth_uri = f"{pred_root}/truth/{label}_truth_s2.tif"
+            truth_uri = (f"{pred_root}/truth/{output_subdir}/{label}_truth_s2.tif"
+                         if output_subdir
+                         else f"{pred_root}/truth/{label}_truth_s2.tif")
             tsize = _write_geotiff(truth_uri, truth_mosaic, t_trans, t_crs, out_band_names)
             LOG.info("  wrote %s (%d B)", truth_uri, tsize)
 

@@ -10,12 +10,16 @@ from setuptools import setup, find_packages
 
 setup(
     name="gee_s1s2_translator_training",
-    version="0.3.0",
-    description="Phase 2 U-Net training + inference package for the GEE S1->S2 translator",
+    version="0.4.0",
+    description="Phase 2 U-Net training + inference + endpoint deployment for the GEE S1->S2 translator",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     python_requires=">=3.10",
     # rasterio is needed by predict_aois for GeoTIFF output; pre-built TF image
-    # ships numpy + tensorflow but not rasterio.
-    install_requires=["rasterio>=1.3"],
+    # ships numpy + tensorflow but not rasterio. google-cloud-aiplatform is
+    # needed by deploy_endpoint for the Vertex AI Endpoint lifecycle.
+    install_requires=[
+        "rasterio>=1.3",
+        "google-cloud-aiplatform>=1.50",
+    ],
 )
