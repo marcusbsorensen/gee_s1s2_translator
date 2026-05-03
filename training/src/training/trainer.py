@@ -23,6 +23,8 @@ import csv
 import io
 import json
 import logging
+import os
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -33,6 +35,61 @@ import tensorflow as tf
 from .losses import combined_l1_l2_loss
 
 LOG = logging.getLogger(__name__)
+
+
+def _save_model_robust(model: tf.keras.Model, uri: str) -> None:
+    """Save a Keras model, working around the .keras-format-on-GCS gotcha.
+
+    Keras 3's ``.keras`` format internally uses ``zipfile.ZipFile`` to write
+    the saved-model archive, and zipfile does not understand ``gs://`` URIs.
+    On some TF versions ``model.save("gs://...keras")`` silently writes
+    nothing, so checkpoint resumption later finds no file. Saving to a local
+    temp file first and then copying via ``tf.io.gfile`` makes the operation
+    reliable across TF versions.
+    """
+    if uri.startswith("gs://") and uri.endswith(".keras"):
+        with tempfile.NamedTemporaryFile(suffix=".keras", delete=False) as tmp:
+            local_path = tmp.name
+        try:
+            model.save(local_path)
+            tf.io.gfile.copy(local_path, uri, overwrite=True)
+        finally:
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
+    else:
+        model.save(uri)
+
+
+class _GcsModelCheckpoint(tf.keras.callbacks.Callback):
+    """Save-on-improvement model checkpoint that writes to GCS reliably.
+
+    Equivalent to ``tf.keras.callbacks.ModelCheckpoint(save_best_only=True,
+    save_weights_only=False)`` but routes the ``model.save`` call through
+    :func:`_save_model_robust`, which handles ``gs://`` destinations for
+    the ``.keras`` format on TF versions where the built-in path silently
+    drops the write.
+    """
+
+    def __init__(self, filepath: str, monitor: str = "val_rmse",
+                 mode: str = "min") -> None:
+        super().__init__()
+        self.filepath = filepath
+        self.monitor = monitor
+        self.mode = mode
+        self.best = float("inf") if mode == "min" else float("-inf")
+
+    def on_epoch_end(self, epoch: int, logs: dict | None = None) -> None:
+        if not logs:
+            return
+        current = logs.get(self.monitor)
+        if current is None:
+            return
+        improved = (current < self.best) if self.mode == "min" else (current > self.best)
+        if improved:
+            self.best = float(current)
+            _save_model_robust(self.model, self.filepath)
 
 
 @dataclass
@@ -126,14 +183,14 @@ def train(
 
     # Per-epoch checkpoint to GCS. Without this, an interrupted ``fit()``
     # (Colab session ceiling, lost connection) would leave nothing on GCS
-    # because the post-fit ``model.save()`` below never runs. ModelCheckpoint
-    # writes whenever val_rmse improves, so the resume path always finds a
-    # usable file.
-    callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+    # because the post-fit ``model.save()`` below never runs. The custom
+    # ``_GcsModelCheckpoint`` writes whenever val_rmse improves and routes
+    # the save through :func:`_save_model_robust` so the .keras archive
+    # reliably lands on GCS on every TF version (Vertex's tf-gpu.2-15
+    # image silently drops gs://...keras writes; Colab's TF does not).
+    callbacks.append(_GcsModelCheckpoint(
         filepath=checkpoint_uri,
         monitor="val_rmse", mode="min",
-        save_best_only=True, save_weights_only=False,
-        verbose=0,
     ))
 
     # CSV log + partial sidecar to GCS after each epoch. The CSV gives an
@@ -199,7 +256,7 @@ def train(
     epochs_run = len(history_rows)
 
     # Save model + sidecar.
-    model.save(checkpoint_uri)
+    _save_model_robust(model, checkpoint_uri)
     sidecar = {
         "best_val_rmse": best_rmse,
         "best_epoch": best_epoch,
