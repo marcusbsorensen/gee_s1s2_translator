@@ -19,11 +19,14 @@ ML or remote-sensing experience; the technical depth is in the code.
 
 When run end to end, this repository:
 
-1. Builds 16 areas of interest (AOIs): two fire perimeters from your
-   Surrey Wildlife Trust KML, one wider TBH SPA polygon, two fire-area
-   training buffers, ten new heath training sites across Surrey / the
-   New Forest / the Dorset Heaths, the held-out Ashdown Forest test
-   site, and the Hankley Common sanity-check site.
+1. Builds 16 areas of interest (AOIs), 13 of which carry a training
+   role: two fire-perimeter inference targets from your Surrey Wildlife
+   Trust KML, one wider TBH SPA training polygon, two fire-area training
+   buffers, nine heath training sites across Surrey / the New Forest /
+   the Dorset Heaths, the Ashdown Forest held-out test site (training
+   role, `force_split: test`), and the Hankley Common sanity-check
+   target. Same AOI structure as the v2 PyTorch project's augmented
+   config.
 2. Searches Earth Engine for matched pairs of Sentinel-1 SAR and
    Sentinel-2 optical acquisitions over each AOI in four cloud-free
    date windows, plus the post-fire 2022 inference window.
@@ -142,6 +145,35 @@ Each TFRecord example is one 256x256 patch with eight float32 bands:
 * S2: B02, B03, B04, B08, B11, B12 (reflectance, scaled to [0, 1])
 
 This format is what the Phase 2 Colab training notebook reads directly.
+
+## Per-bucket yield variance is meteorology, not a pipeline issue
+
+The harvest finds far more candidate (S1, S2) pairs in some (AOI, window)
+buckets than others. Three drivers to know about:
+
+1. **AOI size.** The patch is 256 px at 10 m = 2.56 km on a side. A 1.5 km
+   point-buffer AOI can fit at most one 50 %-overlap patch; a 95 km² polygon
+   like the TBH SPA training area fits dozens. The sampler logs
+   `random_patches: only N/M sampled` when budget exceeds AOI capacity.
+2. **Cloud climatology over the AOI's window.** UK heath-mapping windows
+   target April–September; some summers stay cloudy for weeks. The harvest
+   pre-filters S2 tiles at 12 % cloud (1.5× the 8 % AOI limit) before
+   pairing, so a cloudy month produces few candidate pairs even before the
+   per-AOI cloud check runs.
+3. **Temporal pairing.** S1 and S2 must come within `max_temporal_separation_days`
+   (default 2.5 d) of each other. A surviving S2 scene paired with no S1
+   acquisition in the window is dropped here.
+
+Concrete example from the v1 harvest (2026-05-01): both **Frensham Common**
+and **Hankley Common** for window `comparison 2023` accepted just 1 pair.
+Both AOIs picked the same single clean S2 scene (`20230526T110629...T30UXB`,
+0.0-0.2 % cloud) — the only acquisition that survived the tile-level cloud
+pre-filter. The 2023 window's `rejected_temporal: 58` rules out scheduling
+mismatch; the rest of the bucket failed the cloud pre-filter, not the AOI
+cloud check. Same AOIs in `comparison 2024` yielded 2 pairs each. UK summer
+2023 was unusually cloudy; this is meteorology, not SCL behaviour or a
+pipeline bug. **Phase 2 training is fine to use these single-pair buckets**
+as long as the per-(AOI, window) sample-budget total is honoured.
 
 ## Verifying the TFRecord output
 

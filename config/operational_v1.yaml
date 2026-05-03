@@ -156,7 +156,14 @@ date_windows:
   - { start: "2022-04-01", end: "2022-08-15", label: "pre-fire 2022" }
   - { start: "2023-04-01", end: "2023-09-30", label: "comparison 2023" }
   - { start: "2024-04-01", end: "2024-09-30", label: "comparison 2024" }
-  - { start: "2022-08-20", end: "2022-11-30", label: "post-fire 2022", role: inference }
+  # post-fire 2022 covers the active-burn / first-recovery period for the Brentmoor
+  # and Poors Allotment fires. Cloud cover is intentionally NOT filtered for this
+  # window: Sentinel-2 is largely unusable here (the whole point of the cloud-
+  # penetrating Sentinel-1 → Sentinel-2 reconstruction), but the harvest still
+  # needs S1 patches at these dates for inference. ``cloud_cover_override_pct``
+  # = 100 makes the pipeline accept any S2 scene as the pairing target.
+  - { start: "2022-08-20", end: "2022-11-30", label: "post-fire 2022", role: inference,
+      cloud_cover_override_pct: 100 }
   - { start: "2024-06-01", end: "2024-08-31", label: "sanity check 2024", role: inference }
 
 sentinel2:
@@ -218,6 +225,15 @@ inference:
   output_subprefix: predictions           # bucket://<prefix>/operational_v1/predictions/...
   derive_indices_from_predicted_reflectance: true
   apply_to:
+    # Original perimeter-buffer targets (small spatial extent, no harvest yet).
     - { aoi: "Brentmoor Heath fire perimeter", date_window: "post-fire 2022" }
     - { aoi: "Poors Allotment fire perimeter", date_window: "post-fire 2022" }
     - { aoi: "Hankley Common sanity check", date_window: "sanity check 2024" }
+    # Larger 2.5 km buffer area-training AOIs at the post-fire 2022 window —
+    # added so the cloud-covered scenes get harvested over the full fire-
+    # observation footprint, not just the small mapped fire perimeter.
+    # Brentmoor area training and Poors Allotment area training are role:
+    # training AOIs in this config; the harvest pipeline accepts inference
+    # apply_to entries for any AOI regardless of role.
+    - { aoi: "Brentmoor area training", date_window: "post-fire 2022" }
+    - { aoi: "Poors Allotment area training", date_window: "post-fire 2022" }

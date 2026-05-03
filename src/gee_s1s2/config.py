@@ -130,6 +130,12 @@ class DateWindow(_StrictBase):
     end: date
     label: str
     role: Literal["training", "inference"] = "training"
+    # Optional per-window override of the global S2 cloud-cover acceptance
+    # threshold. Used by the post-fire 2022 cloud-penetration window where the
+    # whole point is to harvest cloud-covered scenes (set to 100 to accept any
+    # S2 scene as the pairing target). If None, the global
+    # ``sentinel2.max_aoi_cloud_cover_percent`` applies.
+    cloud_cover_override_pct: float | None = None
 
     @model_validator(mode="after")
     def _start_before_end(self) -> "DateWindow":
