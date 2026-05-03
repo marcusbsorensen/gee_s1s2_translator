@@ -124,12 +124,25 @@ def train(
     )
     callbacks.append(early)
 
-    # CSV log to GCS after each epoch (re-write the whole CSV each time;
-    # epoch counts are small enough that this is cheap). When resuming,
-    # ``history_rows`` is pre-seeded with the prior run's rows so the new
-    # log appends rather than overwrites.
+    # Per-epoch checkpoint to GCS. Without this, an interrupted ``fit()``
+    # (Colab session ceiling, lost connection) would leave nothing on GCS
+    # because the post-fit ``model.save()`` below never runs. ModelCheckpoint
+    # writes whenever val_rmse improves, so the resume path always finds a
+    # usable file.
+    callbacks.append(tf.keras.callbacks.ModelCheckpoint(
+        filepath=checkpoint_uri,
+        monitor="val_rmse", mode="min",
+        save_best_only=True, save_weights_only=False,
+        verbose=0,
+    ))
 
-    class GcsCsvLogger(tf.keras.callbacks.Callback):
+    # CSV log + partial sidecar to GCS after each epoch. The CSV gives an
+    # interrupted run a usable training curve. The partial sidecar lets the
+    # resume path know ``epochs_run`` and best metric even when ``fit()`` is
+    # killed mid-training (the post-fit final sidecar below never runs in
+    # that case). Whole-file rewrites are fine — epoch counts are small.
+
+    class GcsLogger(tf.keras.callbacks.Callback):
         def on_epoch_end(self, epoch: int, logs: dict | None = None) -> None:
             row = {"epoch": epoch + 1, **(logs or {})}
             history_rows.append(row)
@@ -141,7 +154,26 @@ def train(
             with tf.io.gfile.GFile(log_uri, "w") as f:
                 f.write(buf.getvalue())
 
-    callbacks.append(GcsCsvLogger())
+            val_rmse_history = [float(r["val_rmse"]) for r in history_rows
+                                if "val_rmse" in r]
+            partial = {
+                "best_val_rmse": float(min(val_rmse_history)),
+                "best_epoch": int(np.argmin(val_rmse_history)) + 1,
+                "epochs_run": epoch + 1,
+                "trained_at": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"),
+                "learning_rate": learning_rate,
+                "max_epochs": max_epochs,
+                "early_stopping_patience": early_stopping_patience,
+                "loss": "L1 + 0.5 * L2",
+                "model_name": model.name,
+                "extra": extra_metadata or {},
+                "_partial": True,
+            }
+            with tf.io.gfile.GFile(sidecar_uri, "w") as f:
+                json.dump(partial, f, indent=2)
+
+    callbacks.append(GcsLogger())
 
     # Snapshot prior history before fit() appends to history_rows.
     prior_val_rmse = [float(r["val_rmse"]) for r in history_rows if "val_rmse" in r]
