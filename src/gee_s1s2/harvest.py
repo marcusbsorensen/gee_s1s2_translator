@@ -84,8 +84,16 @@ def run_harvest(
     dry_run: bool = False,
     only_aoi: str | None = None,
     only_window: str | None = None,
+    include_inference_windows: bool = False,
 ) -> HarvestSummary:
-    """Run the harvest. Returns a :class:`HarvestSummary`."""
+    """Run the harvest. Returns a :class:`HarvestSummary`.
+
+    ``include_inference_windows`` defaults to False so the standard training
+    harvest skips windows declared with ``role: inference`` (the original
+    behaviour). The post-fire 2022 cloud-penetration extension flips this to
+    True so it can harvest the inference-only window into the same patch
+    layout as everything else.
+    """
     summary = HarvestSummary()
 
     if not dry_run:
@@ -121,7 +129,7 @@ def run_harvest(
         ]
 
         for window in config.date_windows:
-            if window.role == "inference":
+            if window.role == "inference" and not include_inference_windows:
                 continue
             if only_window and window.label != only_window:
                 continue
@@ -181,11 +189,16 @@ def run_harvest(
                         pair.s2.id, exc,
                     )
                     cloud_pct = 100.0
-                ok = cloud_pct <= config.sentinel2.max_aoi_cloud_cover_percent
+                cloud_limit = (
+                    window.cloud_cover_override_pct
+                    if window.cloud_cover_override_pct is not None
+                    else config.sentinel2.max_aoi_cloud_cover_percent
+                )
+                ok = cloud_pct <= cloud_limit
                 LOG.info(
-                    "AOI cloud check: %s %.1f%% (limit %.1f%%) %s",
-                    pair.s2.id, cloud_pct,
-                    config.sentinel2.max_aoi_cloud_cover_percent,
+                    "AOI cloud check: %s %.1f%% (limit %.1f%%%s) %s",
+                    pair.s2.id, cloud_pct, cloud_limit,
+                    " override" if window.cloud_cover_override_pct is not None else "",
                     "ACCEPT" if ok else "REJECT",
                 )
                 if ok:
