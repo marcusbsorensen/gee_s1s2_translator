@@ -29,16 +29,36 @@ project / bucket / run-name, then Run All.
 
 | Item | Free Colab tier (T4) |
 | --- | --- |
-| Linear baseline training | ~3–5 min |
+| Linear baseline training | ~10–20 min |
 | U-Net training (≤ 80 epochs, early-stop usually fires by epoch 30–50) | ~25–50 min |
 | Validation pass on full test set | ~2–5 min |
-| **Total** | **30–60 min** |
+| **Total** | **40–80 min** |
 | Cost | **£0** (Colab free tier) |
+
+The dataset is cached in T4 RAM after the first epoch (`tf.data.Dataset.cache()`
+in `data.py`), so per-epoch wall-clock is dominated by GPU compute, not GCS I/O.
 
 If GPU allocation fails repeatedly during testing (rare but possible on
 free tier), Colab Pro at £9.99/month is a fallback; the notebook works
 unchanged. For a one-off operational training run, the free tier is
 fine.
+
+### Surviving Colab's 12-hour session limit
+
+The free tier disconnects any session after ~12 hours regardless of
+activity. With the cache fix above, total training comfortably fits in
+a single session. But if training does get interrupted, the trainer
+auto-resumes from the most recent GCS-saved checkpoint on the next
+`Run all`: weights and epoch counter are loaded from
+`<run_prefix>/<model>.keras` + `<model>_sidecar.json`. To force a fresh
+run, pass `resume=False` to `train_model(...)` in the notebook (or
+change `TRAINING_RUN_NAME` to write to a new sub-prefix).
+
+For datasets that genuinely need >12 hours of training, run the same
+notebook code as a Vertex AI Custom Training job (Phase 3 deploys this
+path; the same TFRecords and trainer module work unchanged). Vertex
+removes the session ceiling and runs unattended — at the cost of
+~£0.30/hour of T4 time instead of free.
 
 ## What the notebook produces
 

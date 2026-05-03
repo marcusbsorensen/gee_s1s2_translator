@@ -232,13 +232,21 @@ def build_dataset(
     seed: int = 42,
     patch_hw: int = DEFAULT_PATCH_HW,
 ) -> tf.data.Dataset:
-    """Build a ``tf.data.Dataset`` of (s1, s2) tensors from TFRecord URIs."""
+    """Build a ``tf.data.Dataset`` of (s1, s2) tensors from TFRecord URIs.
+
+    Decoded patches are cached in memory so subsequent epochs do not re-stream
+    from GCS — the dominant bottleneck on free-tier Colab. The Phase 1 dataset
+    (~600 patches at 256x256x8 float32 ≈ 1.2 GB decoded) fits comfortably in
+    T4 RAM. For larger datasets, swap ``cache()`` for ``cache("/tmp/<name>")``
+    to spill to the runtime's local SSD.
+    """
     decode = _build_decoder(stats, apply_lee=apply_lee, hw=patch_hw)
     ds = tf.data.TFRecordDataset(uris, compression_type="GZIP",
                                  num_parallel_reads=tf.data.AUTOTUNE)
+    ds = ds.map(decode, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.cache()
     if shuffle:
         ds = ds.shuffle(shuffle_buffer, seed=seed, reshuffle_each_iteration=True)
-    ds = ds.map(decode, num_parallel_calls=tf.data.AUTOTUNE)
     if repeat:
         ds = ds.repeat()
     ds = ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
