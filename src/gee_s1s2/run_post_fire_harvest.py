@@ -123,9 +123,21 @@ def main() -> int:
         )
     LOG.info("Loading config from %s", config_path)
 
+    # Pydantic validates KML paths at load time (AOISource has an `exists()`
+    # check), so we patch the raw YAML text before validation: rewrite the
+    # operational config's relative ``../s1s2-translator/inputs/<NAME>.kml``
+    # paths to the absolute locally-staged KMLs.
+    raw_yaml = config_path.read_text(encoding="utf-8")
+    for fname, local in kml_local_paths.items():
+        raw_yaml = raw_yaml.replace(
+            f"../s1s2-translator/inputs/{fname}", str(local)
+        )
+    patched_path = workdir / "operational_v1_patched.yaml"
+    patched_path.write_text(raw_yaml, encoding="utf-8")
+    LOG.info("Wrote patched config: %s", patched_path)
+
     from .config import load_config
-    config = load_config(config_path)
-    _patch_config_kml_paths(config, kml_local_paths)
+    config = load_config(patched_path)
 
     # --- Run the filtered harvest ---
     from .harvest import run_harvest
