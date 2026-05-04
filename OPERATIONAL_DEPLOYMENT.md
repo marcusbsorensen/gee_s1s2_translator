@@ -14,27 +14,77 @@ damage map even though it's been raining for three weeks?", read on.
 
 ## What this tool produces
 
-Two figures from a real run over Brentmoor Heath, October 2022. The fire
-happened in late August / early September 2022 — Surrey Wildlife Trust
-field-mapped the perimeter (red outline). The 18 October 2022 Sentinel-2
-optical image of this scene is cloud-covered and unusable; the figures
-below are predicted from the matching cloud-penetrating Sentinel-1 radar
-acquisition.
+Two figures from real Surrey Wildlife Trust fire sites in 2022. Both
+fires happened in late August / early September; the Sentinel-2 optical
+image of the immediate post-fire window is cloud-covered and unusable.
+The figures below are predicted from the matching cloud-penetrating
+Sentinel-1 radar acquisition. The red outline in each is SWT's
+field-mapped perimeter, surveyed on the ground.
 
 ![Predicted Sentinel-2 RGB over Brentmoor Heath, 18 Oct 2022, with SWT-mapped fire perimeter in red](docs/images/brentmoor_success_example_rgb.png)
 
-![Predicted NBR over Brentmoor Heath, 18 Oct 2022, with SWT-mapped fire perimeter in red](docs/images/brentmoor_success_example_nbr.png)
+*RGB composite — Brentmoor Heath, predicted from the 18 Oct 2022
+Sentinel-1 acquisition. The 0.33 ha burn site sits near the centre of
+the frame, visibly different from the surrounding unburnt heath.*
 
-The RGB composite shows the predicted scene — close to a real Sentinel-2
-image, with the burn site visibly different from surrounding heath. The
-NBR (Normalised Burn Ratio) panel is the workhorse for fire-scar mapping;
-the burn site sits near a local NBR minimum, threshold-able the same way
-you'd threshold a real Sentinel-2 NBR raster. (Honest caveat: the model
-is currently smoothing high-frequency variance below the operational
-75 % bracket on driver bands — see [Limitations](#limitations) and the
-threshold-calibration recipe below.)
+![Predicted dNBR over Poors Allotment, 10 Jul 2022 minus 18 Oct 2022, with SWT-mapped fire perimeter in red](docs/images/poors_allotment_dnbr_with_perimeter.png)
+
+*Predicted dNBR — Poors Allotment (6.79 ha burn). Pre-fire NBR (10 Jul
+2022, peak summer growth) minus post-fire NBR (18 Oct 2022). Red /
+orange = larger NBR drop = higher burn severity. The SWT field-mapped
+perimeter (red line) sits over a clear positive-dNBR region.*
+
+dNBR is the standard burn-severity metric. **Honest caveats from the
+validation report:** the model smooths high-frequency variance below
+the operational 75 % bracket on three of four driver bands, so the
+predicted dNBR is muted compared to what real Sentinel-2 dNBR would
+show. The signal is still operationally useful for *perimeter
+delineation* with a re-calibrated threshold; it is less useful for
+*severity classification* until variance retention is improved (see
+[Limitations](#limitations) and the threshold-calibration recipe in
+"How to interpret the outputs"). The horizontal red stripe in the
+Poors panel is a patch-boundary mosaic artefact, not a real fire
+signal.
 
 ---
+
+## Worked example on a fresh site
+
+A demonstration that the model produces sensible predicted reflectance
+on a UK lowland-heath site **outside its training distribution**. We
+picked Cavenham Heath SSSI in the Suffolk Brecks (~52.29° N, 0.59° E),
+roughly 100 km north-east of the nearest training AOI and on a different
+Sentinel-2 tile. Site-defined as a 2 000 m point-buffer; harvest +
+inference run end-to-end via the operator-facing scripts (Workflows 3
+and 1 below).
+
+![Cavenham Heath worked example: actual Sentinel-2 RGB next to U-Net predicted RGB, 26 June 2024](docs/images/worked_example_cavenham.png)
+
+The predicted RGB (right) is recognisably the same landscape as the
+truth Sentinel-2 image (left): field boundaries, the heath / arable
+mosaic, scattered woodland all show in the right places. The prediction
+is lower-contrast and slightly flattened — the model smooths
+high-frequency texture, consistent with the variance-retention
+caveat noted above.
+
+Headline numbers (full breakdown in [training/WORKED_EXAMPLE_CAVENHAM.md](training/WORKED_EXAMPLE_CAVENHAM.md)):
+
+- Overall test-MAE 0.065 reflectance over 82 k jointly-valid pixels
+- Driver-band variance retention 45 % (vs 55 % on the in-distribution
+  Ashdown OOD set — i.e. about 10 percentage points worse going from
+  Sussex to Suffolk Brecks)
+- B08 (NIR — drives NDVI and NBR) retention **71 %**, just below the
+  75 % operational bracket — actually *better* on Cavenham than on
+  Ashdown
+- B04 (red) and B12 (SWIR-2) collapse hard — 21 % and 28 % retention
+  respectively, so dNBR thresholds calibrated on training data will
+  need re-fitting for the Brecks regime
+
+**Operational read:** the model is credible for perimeter delineation
+at a fresh lowland-heath site without re-training, but absolute
+reflectance and severity classification need local threshold
+re-calibration (or a re-train including Brecks AOIs — Workflow 4
+below, ~£1 and one day's work).
 
 ## What this tool does
 
