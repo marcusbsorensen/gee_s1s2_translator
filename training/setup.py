@@ -10,7 +10,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="gee_s1s2_translator_training",
-    version="0.5.0",
+    version="0.5.1",
     description="Phase 2/3 U-Net training (incl. Phase B/C variants) + inference + endpoint deployment for the GEE S1->S2 translator",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
