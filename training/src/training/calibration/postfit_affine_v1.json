@@ -1,0 +1,43 @@
+{
+  "fit_source": "Cavenham Heath SSSI 2024-06-26 (predicted vs truth)",
+  "fit_n_pixels": 81996,
+  "schema": "y_corrected = slope * y_predicted + intercept (per band, in [0,1] reflectance)",
+  "bands": {
+    "B02": {
+      "slope": 1.2793022394180298,
+      "intercept": 0.007700016722083092,
+      "fit_rmse": 0.024956315755844116,
+      "fit_n_pixels": 81996
+    },
+    "B03": {
+      "slope": 0.6873834133148193,
+      "intercept": 0.05005642771720886,
+      "fit_rmse": 0.03352339193224907,
+      "fit_n_pixels": 81996
+    },
+    "B04": {
+      "slope": 1.4830279350280762,
+      "intercept": 0.019762391224503517,
+      "fit_rmse": 0.05625312402844429,
+      "fit_n_pixels": 81996
+    },
+    "B08": {
+      "slope": 0.44019442796707153,
+      "intercept": 0.2398296743631363,
+      "fit_rmse": 0.095941923558712,
+      "fit_n_pixels": 81996
+    },
+    "B11": {
+      "slope": 0.011997235007584095,
+      "intercept": 0.26525595784187317,
+      "fit_rmse": 0.07945306599140167,
+      "fit_n_pixels": 81996
+    },
+    "B12": {
+      "slope": 0.3009624481201172,
+      "intercept": 0.16126315295696259,
+      "fit_rmse": 0.100194551050663,
+      "fit_n_pixels": 81996
+    }
+  }
+}

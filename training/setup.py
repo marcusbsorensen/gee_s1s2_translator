@@ -10,16 +10,24 @@ from setuptools import setup, find_packages
 
 setup(
     name="gee_s1s2_translator_training",
-    version="0.5.1",
-    description="Phase 2/3 U-Net training (incl. Phase B/C variants) + inference + endpoint deployment for the GEE S1->S2 translator",
+    version="0.6.0",
+    description="Phase 2/3 U-Net training + inference (incl. cosine-blended mosaic + post-fit affine calibration + PNG previews) + endpoint deployment for the GEE S1->S2 translator",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
+    package_data={
+        # Ship the post-fit affine calibration JSON so predict_aois can
+        # apply it at inference without an external download.
+        "training": ["calibration/*.json"],
+    },
+    include_package_data=True,
     python_requires=">=3.10",
     # rasterio is needed by predict_aois for GeoTIFF output; pre-built TF image
-    # ships numpy + tensorflow but not rasterio. google-cloud-aiplatform is
-    # needed by deploy_endpoint for the Vertex AI Endpoint lifecycle.
+    # ships numpy + tensorflow but not rasterio + matplotlib.
+    # google-cloud-aiplatform is needed by deploy_endpoint for the Vertex AI
+    # Endpoint lifecycle. matplotlib is needed by the preview-PNG renderer.
     install_requires=[
         "rasterio>=1.3",
+        "matplotlib>=3.5",
         "google-cloud-aiplatform>=1.50",
     ],
 )
