@@ -12,6 +12,30 @@ damage map even though it's been raining for three weeks?", read on.
 
 ---
 
+## What this tool produces
+
+Two figures from a real run over Brentmoor Heath, October 2022. The fire
+happened in late August / early September 2022 — Surrey Wildlife Trust
+field-mapped the perimeter (red outline). The 18 October 2022 Sentinel-2
+optical image of this scene is cloud-covered and unusable; the figures
+below are predicted from the matching cloud-penetrating Sentinel-1 radar
+acquisition.
+
+![Predicted Sentinel-2 RGB over Brentmoor Heath, 18 Oct 2022, with SWT-mapped fire perimeter in red](docs/images/brentmoor_success_example_rgb.png)
+
+![Predicted NBR over Brentmoor Heath, 18 Oct 2022, with SWT-mapped fire perimeter in red](docs/images/brentmoor_success_example_nbr.png)
+
+The RGB composite shows the predicted scene — close to a real Sentinel-2
+image, with the burn site visibly different from surrounding heath. The
+NBR (Normalised Burn Ratio) panel is the workhorse for fire-scar mapping;
+the burn site sits near a local NBR minimum, threshold-able the same way
+you'd threshold a real Sentinel-2 NBR raster. (Honest caveat: the model
+is currently smoothing high-frequency variance below the operational
+75 % bracket on driver bands — see [Limitations](#limitations) and the
+threshold-calibration recipe below.)
+
+---
+
 ## What this tool does
 
 `gee_s1s2_translator` is a deep-learning model that **predicts what a
@@ -52,6 +76,123 @@ predicted reflectance bands or the predicted NBR, the same way you would
 on a real Sentinel-2 image. The validation report quantifies how close
 the predicted bands come to truth on a held-out test set; the answer is
 "close enough to be useful for thresholding, with the caveats below."
+
+## Step zero — first-time setup
+
+Aimed at: an officer who has never deployed cloud infrastructure before.
+Plan ~30 minutes for first-time setup; subsequent runs take <5 minutes
+per AOI.
+
+### 0.1 Create a Google Cloud account
+
+1. Go to <https://console.cloud.google.com/>. Sign in with a personal
+   or organisation Google account.
+2. Accept the terms and create a new project. Name it something
+   descriptive, e.g. `wildlife-mapping`. Note the **project ID** Google
+   assigns — you'll use this everywhere as `GEE_S1S2_PROJECT_ID`.
+3. **Enable billing.** Yes, even for free-tier work — Google requires a
+   payment method on file before you can use most APIs. A credit or
+   debit card is required. New accounts include £230 of free credit
+   that more than covers the costs in this doc.
+4. Set a billing alert (3 minutes, see [billing alert recipe](#set-a-billing-alert) below) to protect against runaway cost.
+
+### 0.2 Install the gcloud CLI
+
+The `gcloud` command-line tool lets your terminal talk to Google Cloud.
+Install per the official instructions for your OS:
+<https://cloud.google.com/sdk/docs/install>.
+
+After install, verify with `gcloud --version`.
+
+### 0.3 Authenticate
+
+Two separate auth flows are needed:
+
+```bash
+# Interactive login that scripts inherit (opens a browser)
+gcloud auth login
+
+# Application Default Credentials — used by Python SDKs in this repo
+gcloud auth application-default login
+
+# Tell gcloud which project to act on
+gcloud config set project YOUR_PROJECT_ID
+```
+
+### 0.4 Register for Earth Engine
+
+Free for non-commercial use. Sign up at
+<https://signup.earthengine.google.com/>. Approval is usually fast
+(minutes to hours). Use the same project ID you created above when
+prompted.
+
+### 0.5 Clone the repo and install the Python package
+
+```bash
+git clone https://github.com/marcusbsorensen/gee_s1s2_translator.git
+cd gee_s1s2_translator
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+(On Windows: `.venv\Scripts\activate` instead of `source .venv/bin/activate`.)
+
+### 0.6 Set the required environment variables
+
+Copy this block into your shell, swapping in your project ID and bucket
+name (you'll create the bucket in step 0.8 below):
+
+```bash
+export GEE_S1S2_PROJECT_ID="your-project-id"
+export GEE_S1S2_BUCKET="your-bucket-name"
+export GEE_S1S2_PREFIX="gee_s1s2_translator/operational_v1"
+export GEE_S1S2_LOCATION="europe-west2"
+```
+
+Persist these by adding the lines to `~/.bashrc` or `~/.zshrc` if you
+want them set in every new terminal.
+
+### 0.7 Request the T4 GPU quota
+
+Vertex AI's default T4 GPU quota for new projects is 0; you need at
+least 1 to run training or inference. The path:
+
+1. Console → **IAM & Admin** → **Quotas & System Limits**.
+2. Filter the table by name: `Custom model training Nvidia T4 GPUs per region`.
+3. Filter dimensions: `region:europe-west2` (or whichever region you chose).
+4. Tick the row's checkbox → click **Edit**.
+5. New value: `3` (lets you run two training jobs in parallel with one in
+   reserve; pick `1` if you only ever expect to run a single job at a time).
+6. Justification text — this works:
+   > Training and inference for a remote-sensing model used in lowland-heath wildfire mapping. Non-commercial conservation work.
+7. Click **Submit request**.
+
+Approval is usually automatic within minutes for value 1–3 requests.
+You'll receive an email confirmation. Once approved, you can submit
+training and inference jobs (further down this doc).
+
+### 0.8 Create a Cloud Storage bucket
+
+1. Console → **Cloud Storage** → **Buckets** → **Create**.
+2. Name: globally unique. A safe pattern: `<your-org>-fire-mapping`.
+3. Location type: **Region**, value `europe-west2` (must match
+   `GEE_S1S2_LOCATION` so compute and storage are co-located).
+4. Storage class: **Standard**.
+5. Access control: **Uniform**.
+6. **Public access prevention**: enforced (default; leave it on).
+7. Create.
+
+Set `GEE_S1S2_BUCKET` to the name you picked.
+
+### Set a billing alert
+
+Cloud Billing → **Budgets and Alerts** → **Create**. Suggested default:
+£10/month, email alerts at 50 %, 90 %, and 100 % of budget. This
+protects against runaway costs from (e.g.) a forgotten endpoint left
+running.
+
+---
 
 ## What it requires to deploy
 
@@ -109,7 +250,14 @@ entirely and is the right choice for batch evaluation.
 
 ## How to deploy
 
-Three high-level workflows, depending on what you want to do.
+Pick the workflow that matches what you're trying to do:
+
+| What you want | Workflow | Cost (one run) |
+| --- | --- | ---: |
+| Map a small number of fire sites in batches | **Workflow 1** — inference-as-a-job | ~£0.02 |
+| Real-time prediction over an API (e.g. for a custom QGIS plugin) | **Workflow 2** — Vertex AI Endpoint *(see caveats)* | £0.20–0.50/h while running |
+| Adapt the harvest to a new AOI or window | **Workflow 3** — config edit + re-run harvest | ~£0.30 |
+| Re-train the model on a different region | **Workflow 4** — fresh training run | £0.30–0.60 |
 
 ### Workflow 1: predict over our existing AOIs
 
@@ -119,44 +267,67 @@ Ashdown Forest), the trained model is already published and you can
 predict directly.
 
 ```bash
-# Submit an inference Vertex Custom Job (writes 9-band GeoTIFFs to GCS).
+# Default: predict over the project's three example sites.
 python scripts/submit_predict_aois.py
+
+# A specific target — e.g. Brentmoor on the 8 Oct 2022 cloud-covered date:
+python scripts/submit_predict_aois.py \
+    --target brentmoor-area-training:20221008:postfire \
+    --output-subdir post_fire_2022
 ```
 
-Outputs go to `gs://<bucket>/<prefix>/operational_v1/models/v2_equivalent_initial/predictions/unet/`.
+Outputs go to `gs://<bucket>/<prefix>/models/v2_equivalent_initial/predictions/unet/[<subdir>/]`.
 
-### Workflow 2: predict over a new AOI
+### Workflow 2: real-time prediction via Vertex AI Endpoint
 
-Edit `config/operational_v1.yaml`, add your AOI under `aois:`, set its
-`role: target` if it's a fire perimeter you want to predict over (or
-`role: training` if you're harvesting it for a future re-train).
-Re-run the Phase 1 harvest restricted to your new AOI:
+Use this only if you have an interactive use case (custom UI, QGIS
+plugin) that needs sub-second response. The endpoint costs by the hour
+while deployed; for batch evaluation, Workflow 1 is dramatically
+cheaper. See the [endpoint caveat below](#a-note-on-online-inference-vertex-ai-endpoints).
+
+### Workflow 3: harvest a new AOI or new window
+
+Edit `config/operational_v1.yaml`, add your AOI under `aois:` (example
+shape):
+
+```yaml
+aois:
+  - name: "Your Site Name"
+    role: target               # or "training" if you intend to retrain
+    source:
+      type: kml
+      path: ../inputs/your_site.kml
+```
+
+Then run the harvest:
 
 ```bash
-# Local CLI
-python -m gee_s1s2.cli harvest --only-aoi "Your Site Name"
+# Local CLI (small AOI, fast)
+python -m gee_s1s2.cli harvest --aoi "Your Site Name"
 
-# Or as a Vertex Custom Job (recommended for unattended runs > 30 min)
-python scripts/submit_post_fire_harvest.py
+# Or as a Vertex Custom Job (recommended for >30 min runs or
+# multiple AOIs in one shot)
+python scripts/submit_post_fire_harvest.py \
+    --aoi "Your Site Name" \
+    --window "post-fire 2022"
 ```
 
-Then re-run inference as in Workflow 1.
+Then run inference as in Workflow 1.
 
-### Workflow 3: re-train on a different region
+### Workflow 4: re-train on a different region
 
-Rare — only needed if your sites are far enough away from southern
-England that vegetation phenology and S1 calibration regimes differ
-materially. The harvest config supports any AOI definition. You'd:
+Only needed if your sites are far enough away from southern England
+that vegetation phenology or S1 calibration regimes differ materially
+(e.g. Scottish blanket bog, Mediterranean garrigue). This step is
+"single-day work for an analyst familiar with GCP" — open a GitHub
+issue if you'd like a hand. The mechanics:
 
 1. Add new AOIs (yours plus a held-out test AOI in the same regional
    biome) under `aois:`.
 2. Run Phase 1 harvest to populate `gs://<bucket>/<prefix>/patches/`.
-3. Run Phase 2 training: `python scripts/submit_vertex_training.py` —
-   this fits a fresh model from your harvest. Expected ~£0.30–0.60.
-4. Validate against your held-out AOI; compare to v2/this run's metrics
-   in `validation_report.md`.
-
-The end-to-end is single-day work for an analyst familiar with GCP.
+3. Train: `python scripts/submit_vertex_training.py --run-name my_first_retrain`. Expected ~£0.30–0.60.
+4. Validate against your held-out AOI; compare to the baseline metrics
+   in `models/<run_name>/validation_report.md`.
 
 ## A note on online inference (Vertex AI Endpoints)
 
@@ -327,3 +498,20 @@ multi-tenant or shared-bucket scenario.
   numbers we compare against
 - `config/operational_v1.yaml` — the YAML that controls the whole
   pipeline; this is where you start when adapting to a new region
+
+---
+
+## Where to ask for help
+
+- **GitHub Issues:** <https://github.com/marcusbsorensen/gee_s1s2_translator/issues>
+  is the primary support channel. Please include: the command you ran,
+  the full error message, the value of the relevant env vars (mask
+  anything secret), and the Vertex job ID if your run reached Vertex.
+- **Email:** Sonia Lasocki (project lead, dissertation author) and
+  Marcus Sorensen (engineering) — addresses on the GitHub profile pages
+  linked from the repo. Please prefer Issues for anything reproducible
+  so other operators can find the answer later.
+
+If you're stuck inside the cloud setup (steps 0.1–0.4), Google Cloud
+support is faster than we are for billing or auth issues — they have a
+free chat tier under Console → ⓘ Help.
