@@ -6,6 +6,18 @@ Cell 2 supports), so a Vertex Custom Training job can be configured by
 setting env vars on the worker pool spec. This is the same code path
 the notebook uses; only the orchestration changes.
 
+Phase dispatch — the entrypoint supports three model variants, selected
+by ``GEE_S1S2_PHASE``:
+
+* ``""`` or ``"baseline"`` (default) — the v2-equivalent run (sigmoid
+  output, L1+0.5*L2 loss, constant LR 1e-4).
+* ``"b"`` — Phase B: linear output (clipped at inference), L1+0.5*L2 +
+  variance-matching term (warmup at epoch 30, weight 0.3), cosine LR
+  decay 1e-4 -> 1e-5 over the full 120-epoch budget, patience 25.
+* ``"c"`` — Phase C: residual U-Net (linear S1->reflectance baseline +
+  U-Net delta, sigmoid'd at the sum). All other hyperparameters match
+  the baseline.
+
 Smoke-test mode: set ``GEE_S1S2_SMOKE_TEST_N_PATCHES=32`` (or any small
 int) to slice the manifest down to the first N train patches. Used to
 exercise the data pipeline + one full epoch end-to-end without paying
@@ -26,7 +38,8 @@ import tensorflow as tf
 from .data import (
     build_dataset, load_manifest, load_or_compute_s1_stats, split_uris,
 )
-from .model import build_unet
+from .losses import CombinedL1L2VarianceLoss, VarianceWeightWarmup
+from .model import build_unet, build_residual_unet
 from .trainer import train as train_model
 
 LOG = logging.getLogger("train_unet")
@@ -66,16 +79,39 @@ def main() -> int:
             "GEE_S1S2_PROJECT_ID and GEE_S1S2_BUCKET must both be set."
         )
 
+    phase = (_env("GEE_S1S2_PHASE", "") or "").strip().lower()
+    if phase not in ("", "baseline", "b", "c"):
+        raise RuntimeError(
+            f"Unrecognised GEE_S1S2_PHASE={phase!r}; "
+            "must be one of '', 'baseline', 'b', 'c'."
+        )
+
+    # Per-phase defaults override the legacy defaults; explicit env vars still
+    # win, so the operator can dial in any individual value.
+    if phase == "b":
+        default_max_epochs = 120
+        default_patience = 25
+    else:
+        default_max_epochs = 80
+        default_patience = 15
+
     batch_size = _env_int("GEE_S1S2_BATCH_SIZE", 8)
-    max_epochs = _env_int("GEE_S1S2_MAX_EPOCHS", 80)
+    max_epochs = _env_int("GEE_S1S2_MAX_EPOCHS", default_max_epochs)
     learning_rate = _env_float("GEE_S1S2_LEARNING_RATE", 1e-4)
-    early_stopping_patience = _env_int("GEE_S1S2_EARLY_STOPPING_PATIENCE", 15)
+    early_stopping_patience = _env_int(
+        "GEE_S1S2_EARLY_STOPPING_PATIENCE", default_patience,
+    )
     random_seed = _env_int("GEE_S1S2_RANDOM_SEED", 42)
     s1_lee_already_applied = _env_bool(
         "GEE_S1S2_S1_LEE_ALREADY_APPLIED_AT_HARVEST", True,
     )
     smoke_n = os.environ.get("GEE_S1S2_SMOKE_TEST_N_PATCHES")
     smoke_n = int(smoke_n) if smoke_n else None
+
+    # Phase B-specific knobs.
+    variance_term_weight = _env_float("GEE_S1S2_PHASE_B_VARIANCE_WEIGHT", 0.3)
+    variance_warmup_epoch = _env_int("GEE_S1S2_PHASE_B_VARIANCE_WARMUP_EPOCH", 30)
+    cosine_min_lr = _env_float("GEE_S1S2_PHASE_B_COSINE_MIN_LR", 1e-5)
 
     base_uri = f"gs://{gcs_bucket}/{gcs_prefix}"
     harvest_manifest_uri = f"{base_uri}/manifest.csv"
@@ -126,8 +162,51 @@ def main() -> int:
         shuffle=False, apply_lee=apply_lee_in_pipeline,
     )
 
-    unet = build_unet(input_shape=(256, 256, 2), out_channels=6, base_channels=32)
-    LOG.info("U-Net parameter count: %d", unet.count_params())
+    # Build per-phase model + loss + LR schedule + extra callbacks.
+    extra_callbacks: list = []
+    loss_fn = None  # falls through to combined_l1_l2_loss in trainer
+    loss_label = "L1 + 0.5 * L2"
+    lr_for_optimizer = learning_rate
+
+    if phase == "b":
+        unet = build_unet(
+            input_shape=(256, 256, 2), out_channels=6, base_channels=32,
+            output_activation="linear",
+        )
+        loss_fn = CombinedL1L2VarianceLoss(variance_weight=0.0)
+        extra_callbacks.append(VarianceWeightWarmup(
+            loss_fn=loss_fn,
+            target_weight=variance_term_weight,
+            warmup_epoch=variance_warmup_epoch,
+        ))
+        loss_label = (
+            f"L1 + 0.5 * L2 + {variance_term_weight} * variance_term "
+            f"(warmup at epoch {variance_warmup_epoch})"
+        )
+        # Cosine LR decay 1e-4 -> 1e-5 over the full epoch budget.
+        steps_per_epoch = max(1, len(train_uris) // batch_size)
+        total_decay_steps = max_epochs * steps_per_epoch
+        lr_for_optimizer = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=learning_rate,
+            decay_steps=total_decay_steps,
+            alpha=cosine_min_lr / learning_rate,
+        )
+        LOG.info(
+            "Phase B: linear output, variance term weight=%.3f from epoch %d, "
+            "cosine LR %.3g -> %.3g over %d steps (%d epochs * %d steps/epoch).",
+            variance_term_weight, variance_warmup_epoch,
+            learning_rate, cosine_min_lr, total_decay_steps,
+            max_epochs, steps_per_epoch,
+        )
+    elif phase == "c":
+        unet = build_residual_unet(
+            input_shape=(256, 256, 2), out_channels=6, base_channels=32,
+        )
+        LOG.info("Phase C: residual U-Net (linear S1 baseline + delta, sigmoid'd).")
+    else:
+        unet = build_unet(input_shape=(256, 256, 2), out_channels=6, base_channels=32)
+
+    LOG.info("Model parameter count: %d (name=%s)", unet.count_params(), unet.name)
 
     result = train_model(
         unet,
@@ -135,11 +214,15 @@ def main() -> int:
         checkpoint_uri=model_output_prefix + "unet.keras",
         sidecar_uri=model_output_prefix + "unet_sidecar.json",
         log_uri=model_output_prefix + "train_unet.csv",
-        learning_rate=learning_rate,
+        learning_rate=lr_for_optimizer,
         max_epochs=max_epochs,
         early_stopping_patience=early_stopping_patience,
+        loss_fn=loss_fn,
+        extra_callbacks=extra_callbacks,
+        loss_label=loss_label,
         extra_metadata={
             "run_name": training_run_name,
+            "phase": phase or "baseline",
             "manifest_uri": harvest_manifest_uri,
             "n_train_shards": len(train_uris),
             "n_val_shards": len(val_uris),

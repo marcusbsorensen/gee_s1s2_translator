@@ -12,6 +12,15 @@ Architecture choices (mirrored from v2):
 
 Channel counts at each level: 32 -> 64 -> 128 -> 256 -> 512 (bottleneck),
 then mirrored back. v2 used the same depths.
+
+Variants:
+
+* :func:`build_unet` — the v2-equivalent baseline. ``output_activation``
+  defaults to ``"sigmoid"``; pass ``"linear"`` for the Phase B variant
+  that outputs unbounded reflectance and is clipped at inference time.
+* :func:`build_residual_unet` — Phase C variant. The U-Net predicts a
+  per-pixel delta on top of a 1x1 linear projection of the S1 input,
+  and the final output is ``sigmoid(baseline_logits + delta_logits)``.
 """
 from __future__ import annotations
 
@@ -36,6 +45,7 @@ def build_unet(
     input_shape: tuple[int, int, int] = (256, 256, 2),
     out_channels: int = 6,
     base_channels: int = DEFAULT_BASE_CHANNELS,
+    output_activation: str = "sigmoid",
 ) -> Model:
     """Build a 4-level U-Net.
 
@@ -45,11 +55,18 @@ def build_unet(
         out_channels: number of S2 reflectance bands predicted (default 6:
             B02, B03, B04, B08, B11, B12).
         base_channels: filter count at level 0 (doubled at each deeper level).
+        output_activation: activation on the final 1x1 conv. ``"sigmoid"``
+            (default) maps to [0, 1]. ``"linear"`` returns unbounded
+            logits — pair with inference-time clipping. ``None`` is
+            treated as ``"linear"``.
 
     Returns:
         A compiled-ready Keras :class:`Model`. Compile it externally with
         the loss + optimizer of your choice.
     """
+    if output_activation is None:
+        output_activation = "linear"
+
     inputs = kl.Input(shape=input_shape, name="s1_input")
 
     # Encoder
@@ -82,6 +99,45 @@ def build_unet(
     u1 = kl.Concatenate(name="concat1")([u1, e1])
     d1 = _conv_block(u1, base_channels, "dec1")
 
-    outputs = kl.Conv2D(out_channels, 1, activation="sigmoid", name="output")(d1)
+    outputs = kl.Conv2D(out_channels, 1, activation=output_activation, name="output")(d1)
 
     return Model(inputs=inputs, outputs=outputs, name="unet_s1_to_s2")
+
+
+def build_residual_unet(
+    input_shape: tuple[int, int, int] = (256, 256, 2),
+    out_channels: int = 6,
+    base_channels: int = DEFAULT_BASE_CHANNELS,
+) -> Model:
+    """Phase C variant: U-Net predicts a per-pixel delta on top of a
+    linear-projection baseline of the S1 input.
+
+    The baseline is a single 1x1 conv mapping the 2-channel S1 stack to
+    the ``out_channels``-band reflectance space (in logit units, i.e. no
+    activation). The U-Net produces a delta in the same logit space. The
+    final output is ``sigmoid(baseline_logits + delta_logits)``, so the
+    network is forced to learn the *correction* the U-Net adds to a
+    simple per-pixel linear regressor.
+
+    All other architectural choices match :func:`build_unet`.
+    """
+    inputs = kl.Input(shape=input_shape, name="s1_input")
+
+    # Linear baseline: 1x1 conv from S1 channels straight to per-band logits.
+    baseline_logits = kl.Conv2D(
+        out_channels, 1, activation=None, use_bias=True, name="baseline_logits",
+    )(inputs)
+
+    # U-Net delta in the same logit space (linear output, no activation).
+    delta_unet = build_unet(
+        input_shape=input_shape, out_channels=out_channels,
+        base_channels=base_channels, output_activation="linear",
+    )
+    # Re-name the inner U-Net to avoid scope clash if both are inspected later.
+    delta_logits = delta_unet(inputs)
+    delta_logits = kl.Lambda(lambda x: x, name="delta_logits")(delta_logits)
+
+    summed = kl.Add(name="logits_sum")([baseline_logits, delta_logits])
+    outputs = kl.Activation("sigmoid", name="output")(summed)
+
+    return Model(inputs=inputs, outputs=outputs, name="residual_unet_s1_to_s2")
