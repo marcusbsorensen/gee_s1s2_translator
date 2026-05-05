@@ -56,6 +56,12 @@ def _build_for_phase(phase: str) -> tf.keras.Model:
             input_shape=(256, 256, 2), out_channels=6, base_channels=32,
             output_activation="linear",
         )
+    if phase == "mt":
+        # Multi-temporal: 6-channel S1 input, linear output (Phase B v2 family).
+        return build_unet(
+            input_shape=(256, 256, 6), out_channels=6, base_channels=32,
+            output_activation="linear",
+        )
     return build_unet(input_shape=(256, 256, 2), out_channels=6, base_channels=32)
 
 
@@ -78,7 +84,17 @@ def main() -> int:
         )
 
     base = f"gs://{bucket}/{prefix}"
-    manifest_uri = f"{base}/manifest.csv"
+    # Multi-temporal eval reads patches from a separate prefix (matches
+    # what train_unet does for phase=mt). Models are still under the
+    # operational_v1/models/<run> tree so eval reports land beside it.
+    if phase == "mt":
+        mt_prefix = os.environ.get(
+            "GEE_S1S2_MULTITEMPORAL_PREFIX",
+            "gee_s1s2_translator/multitemporal_v1",
+        )
+        manifest_uri = f"gs://{bucket}/{mt_prefix}/manifest.csv"
+    else:
+        manifest_uri = f"{base}/manifest.csv"
     s1_stats_uri = f"{base}/s1_stats.json"
     model_dir = f"{base}/models/{run_name}/"
     keras_uri = model_dir + "unet.keras"
@@ -121,6 +137,7 @@ def main() -> int:
     test_ds = build_dataset(
         test_uris, stats=stats, batch_size=batch_size,
         shuffle=False, apply_lee=False,
+        multitemporal=(phase == "mt"),
     )
 
     # --- Predict + accumulate (N, H, W, C) ---
@@ -140,9 +157,9 @@ def main() -> int:
     # metrics are computed in the operational reflectance range. The
     # baseline / Phase C use sigmoid so are already in [0, 1] modulo
     # numeric noise; clip is a no-op for them.
-    if phase == "b":
+    if phase in ("b", "mt"):
         y_pred = np.clip(y_pred, 0.0, 1.0)
-        LOG.info("Phase B: clipped predictions to [0, 1].")
+        LOG.info("Phase %s: clipped predictions to [0, 1].", phase.upper())
 
     # --- Compute metrics ---
     per_band = per_band_mae_rmse(y_true, y_pred)

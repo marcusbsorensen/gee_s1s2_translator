@@ -43,6 +43,12 @@ LOG = logging.getLogger(__name__)
 S1_BANDS = ["VV", "VH"]
 S2_BANDS = ["B02", "B03", "B04", "B08", "B11", "B12"]
 ALL_BANDS = S1_BANDS + S2_BANDS
+# Multi-temporal harvest stacks 3 S1 acquisitions (t0 = paired-with-S2,
+# t1w = 7-14d prior, t3w = 14-28d prior) per truth pair.
+S1_BANDS_MULTITEMPORAL = [
+    "VV_t0", "VH_t0", "VV_t1w", "VH_t1w", "VV_t3w", "VH_t3w",
+]
+ALL_BANDS_MULTITEMPORAL = S1_BANDS_MULTITEMPORAL + S2_BANDS
 DEFAULT_PATCH_HW = 256
 
 
@@ -98,15 +104,19 @@ class S1Stats:
     std: dict[str, float]     # per-band std (dB)
 
 
-def _band_feature_spec(hw: int = DEFAULT_PATCH_HW) -> dict:
+def _band_feature_spec(hw: int = DEFAULT_PATCH_HW, multitemporal: bool = False) -> dict:
     """Per-band feature spec for the GEE-exported TFRecord format.
 
     GEE's ``Export.image.toCloudStorage`` with ``patchDimensions=[H, W]``
     writes each band as a flat ``tf.train.FloatList`` of ``H*W`` values
     inside the Example proto. So the right spec is
     ``FixedLenFeature([H*W], tf.float32)`` and we reshape after parsing.
+
+    With ``multitemporal=True``, the spec covers the 6-channel S1 stack
+    (VV/VH × {t0, t1w, t3w}) instead of the single 2-channel S1.
     """
-    return {b: tf.io.FixedLenFeature([hw * hw], tf.float32) for b in ALL_BANDS}
+    bands = ALL_BANDS_MULTITEMPORAL if multitemporal else ALL_BANDS
+    return {b: tf.io.FixedLenFeature([hw * hw], tf.float32) for b in bands}
 
 
 def _peek_patches(uris: Iterable[str], n_max: int,
@@ -184,10 +194,24 @@ def _lee_filter_5x5(x: tf.Tensor) -> tf.Tensor:
                                   padding="SAME")[0]
 
 
-def _build_decoder(stats: S1Stats, apply_lee: bool, hw: int = DEFAULT_PATCH_HW):
-    s1_mean = tf.constant([stats.mean[b] for b in S1_BANDS], dtype=tf.float32)
-    s1_std = tf.constant([stats.std[b] for b in S1_BANDS], dtype=tf.float32)
-    spec = _band_feature_spec(hw)
+def _build_decoder(stats: S1Stats, apply_lee: bool, hw: int = DEFAULT_PATCH_HW,
+                   multitemporal: bool = False):
+    if multitemporal:
+        # Re-use t0 stats (computed on single-temporal corpus) for all 3
+        # S1 epochs since they're the same Mullissa-calibrated S1 distribution.
+        s1_band_names = S1_BANDS_MULTITEMPORAL
+        s1_mean = tf.constant(
+            [stats.mean["VV"], stats.mean["VH"]] * 3, dtype=tf.float32,
+        )
+        s1_std = tf.constant(
+            [stats.std["VV"], stats.std["VH"]] * 3, dtype=tf.float32,
+        )
+    else:
+        s1_band_names = S1_BANDS
+        s1_mean = tf.constant([stats.mean[b] for b in S1_BANDS], dtype=tf.float32)
+        s1_std = tf.constant([stats.std[b] for b in S1_BANDS], dtype=tf.float32)
+    spec = _band_feature_spec(hw, multitemporal=multitemporal)
+    n_s1 = len(s1_band_names)
 
     def _decode(rec):
         parsed = tf.io.parse_single_example(rec, spec)
@@ -195,13 +219,13 @@ def _build_decoder(stats: S1Stats, apply_lee: bool, hw: int = DEFAULT_PATCH_HW):
         # GEE export; reshape to (H, W) and stack to (H, W, C). S1 first,
         # then S2, matching stack_pair_image's export order.
         s1 = tf.stack(
-            [tf.reshape(parsed[b], [hw, hw]) for b in S1_BANDS], axis=-1,
+            [tf.reshape(parsed[b], [hw, hw]) for b in s1_band_names], axis=-1,
         )
         s2 = tf.stack(
             [tf.reshape(parsed[b], [hw, hw]) for b in S2_BANDS], axis=-1,
         )
         # Pin the spatial shape so downstream layers know it.
-        s1.set_shape([hw, hw, len(S1_BANDS)])
+        s1.set_shape([hw, hw, n_s1])
         s2.set_shape([hw, hw, len(S2_BANDS)])
 
         # Replace any non-finite pixels with zero before normalisation.
@@ -211,7 +235,8 @@ def _build_decoder(stats: S1Stats, apply_lee: bool, hw: int = DEFAULT_PATCH_HW):
         if apply_lee:
             s1 = _lee_filter_5x5(s1)
 
-        # Z-score normalise S1.
+        # Z-score normalise S1 (per-channel; for multi-temporal each of the
+        # 6 channels is independently normalised against the same VV/VH stats).
         s1 = (s1 - s1_mean) / s1_std
         # S2 already in [0, 1] from harvest; clamp to be safe.
         s2 = tf.clip_by_value(s2, 0.0, 1.0)
@@ -231,6 +256,7 @@ def build_dataset(
     repeat: bool = False,
     seed: int = 42,
     patch_hw: int = DEFAULT_PATCH_HW,
+    multitemporal: bool = False,
 ) -> tf.data.Dataset:
     """Build a ``tf.data.Dataset`` of (s1, s2) tensors from TFRecord URIs.
 
@@ -239,8 +265,13 @@ def build_dataset(
     (~600 patches at 256x256x8 float32 ≈ 1.2 GB decoded) fits comfortably in
     T4 RAM. For larger datasets, swap ``cache()`` for ``cache("/tmp/<name>")``
     to spill to the runtime's local SSD.
+
+    With ``multitemporal=True``, the decoder reads 6 S1 channels per patch
+    (VV/VH × {t0, t1w, t3w}) instead of 2; the returned ``s1`` tensor has
+    shape (H, W, 6).
     """
-    decode = _build_decoder(stats, apply_lee=apply_lee, hw=patch_hw)
+    decode = _build_decoder(stats, apply_lee=apply_lee, hw=patch_hw,
+                            multitemporal=multitemporal)
     ds = tf.data.TFRecordDataset(uris, compression_type="GZIP",
                                  num_parallel_reads=tf.data.AUTOTUNE)
     ds = ds.map(decode, num_parallel_calls=tf.data.AUTOTUNE)

@@ -80,10 +80,10 @@ def main() -> int:
         )
 
     phase = (_env("GEE_S1S2_PHASE", "") or "").strip().lower()
-    if phase not in ("", "baseline", "b", "c"):
+    if phase not in ("", "baseline", "b", "c", "mt"):
         raise RuntimeError(
             f"Unrecognised GEE_S1S2_PHASE={phase!r}; "
-            "must be one of '', 'baseline', 'b', 'c'."
+            "must be one of '', 'baseline', 'b', 'c', 'mt'."
         )
 
     # Per-phase defaults override the legacy defaults; explicit env vars still
@@ -91,6 +91,10 @@ def main() -> int:
     if phase == "b":
         default_max_epochs = 120
         default_patience = 25
+    elif phase == "mt":
+        # Multi-temporal uses Phase B v2 hyperparameters per Day 2 spec.
+        default_max_epochs = 120
+        default_patience = 40
     else:
         default_max_epochs = 80
         default_patience = 15
@@ -112,9 +116,34 @@ def main() -> int:
     variance_term_weight = _env_float("GEE_S1S2_PHASE_B_VARIANCE_WEIGHT", 0.3)
     variance_warmup_epoch = _env_int("GEE_S1S2_PHASE_B_VARIANCE_WARMUP_EPOCH", 30)
     cosine_min_lr = _env_float("GEE_S1S2_PHASE_B_COSINE_MIN_LR", 1e-5)
+    # Optional per-band variance term weights (Phase B v3 onwards). Comma-
+    # separated 6 floats in S2_BANDS order (B02, B03, B04, B08, B11, B12).
+    # Unset -> uniform variance_term_weight across bands.
+    variance_band_weights_env = os.environ.get("GEE_S1S2_PHASE_B_VARIANCE_BAND_WEIGHTS")
+    variance_band_weights: list[float] | None = None
+    if variance_band_weights_env:
+        variance_band_weights = [float(x) for x in variance_band_weights_env.split(",")]
+        if len(variance_band_weights) != 6:
+            raise RuntimeError(
+                f"GEE_S1S2_PHASE_B_VARIANCE_BAND_WEIGHTS must have 6 floats; "
+                f"got {len(variance_band_weights)}"
+            )
 
+    # Multi-temporal training reads from a parallel prefix
+    # (gs://<bucket>/gee_s1s2_translator/multitemporal_v1/) which has its
+    # own manifest and patches; models still land under operational_v1/
+    # so the eval pipeline can load them next to the baseline.
+    if phase == "mt":
+        mt_prefix = os.environ.get(
+            "GEE_S1S2_MULTITEMPORAL_PREFIX",
+            "gee_s1s2_translator/multitemporal_v1",
+        )
+        manifest_base = f"gs://{gcs_bucket}/{mt_prefix}"
+        harvest_manifest_uri = f"{manifest_base}/manifest.csv"
+    else:
+        manifest_base = f"gs://{gcs_bucket}/{gcs_prefix}"
+        harvest_manifest_uri = f"{manifest_base}/manifest.csv"
     base_uri = f"gs://{gcs_bucket}/{gcs_prefix}"
-    harvest_manifest_uri = f"{base_uri}/manifest.csv"
     model_output_prefix = f"{base_uri}/models/{training_run_name}/"
     s1_stats_uri = f"{base_uri}/s1_stats.json"
 
@@ -153,13 +182,16 @@ def main() -> int:
              stats.mean["VH"], stats.std["VH"])
 
     apply_lee_in_pipeline = not s1_lee_already_applied
+    is_multitemporal = (phase == "mt")
     train_ds = build_dataset(
         train_uris, stats=stats, batch_size=batch_size,
         shuffle=True, apply_lee=apply_lee_in_pipeline, seed=random_seed,
+        multitemporal=is_multitemporal,
     )
     val_ds = build_dataset(
         val_uris, stats=stats, batch_size=batch_size,
         shuffle=False, apply_lee=apply_lee_in_pipeline,
+        multitemporal=is_multitemporal,
     )
 
     # Build per-phase model + loss + LR schedule + extra callbacks.
@@ -173,16 +205,32 @@ def main() -> int:
             input_shape=(256, 256, 2), out_channels=6, base_channels=32,
             output_activation="linear",
         )
-        loss_fn = CombinedL1L2VarianceLoss(variance_weight=0.0)
+        loss_fn = CombinedL1L2VarianceLoss(
+            variance_weight=0.0,
+            variance_band_weights=variance_band_weights,
+        )
+        # The warmup callback gates variance_weight (the global multiplier);
+        # per-band weights stay constant. When per-band weights are set, the
+        # global multiplier should be 1.0 after warmup so per-band weights
+        # are taken at face value; when not set, fall back to the scalar
+        # variance_term_weight (Phase B v2 behaviour).
+        warmup_target = 1.0 if variance_band_weights else variance_term_weight
         extra_callbacks.append(VarianceWeightWarmup(
             loss_fn=loss_fn,
-            target_weight=variance_term_weight,
+            target_weight=warmup_target,
             warmup_epoch=variance_warmup_epoch,
         ))
-        loss_label = (
-            f"L1 + 0.5 * L2 + {variance_term_weight} * variance_term "
-            f"(warmup at epoch {variance_warmup_epoch})"
-        )
+        if variance_band_weights:
+            loss_label = (
+                f"L1 + 0.5 * L2 + sum_b w_b * |std-diff_b| (warmup at epoch "
+                f"{variance_warmup_epoch}; band weights "
+                f"{','.join(f'{w:.2f}' for w in variance_band_weights)})"
+            )
+        else:
+            loss_label = (
+                f"L1 + 0.5 * L2 + {variance_term_weight} * variance_term "
+                f"(warmup at epoch {variance_warmup_epoch})"
+            )
         # Cosine LR decay 1e-4 -> 1e-5 over the full epoch budget.
         steps_per_epoch = max(1, len(train_uris) // batch_size)
         total_decay_steps = max_epochs * steps_per_epoch
@@ -203,6 +251,32 @@ def main() -> int:
             input_shape=(256, 256, 2), out_channels=6, base_channels=32,
         )
         LOG.info("Phase C: residual U-Net (linear S1 baseline + delta, sigmoid'd).")
+    elif phase == "mt":
+        # Multi-temporal: 6-channel S1 input (VV/VH × 3 acquisitions). Reuse
+        # Phase B v2 hyperparameters: linear output + variance-aware loss
+        # + cosine LR decay + warmup at epoch 15 + patience 40.
+        unet = build_unet(
+            input_shape=(256, 256, 6), out_channels=6, base_channels=32,
+            output_activation="linear",
+        )
+        loss_fn = CombinedL1L2VarianceLoss(variance_weight=0.0)
+        extra_callbacks.append(VarianceWeightWarmup(
+            loss_fn=loss_fn, target_weight=variance_term_weight,
+            warmup_epoch=variance_warmup_epoch,
+        ))
+        loss_label = (
+            f"L1 + 0.5 * L2 + {variance_term_weight} * variance_term "
+            f"(warmup at epoch {variance_warmup_epoch}); 6-channel S1 input"
+        )
+        steps_per_epoch = max(1, len(train_uris) // batch_size)
+        total_decay_steps = max_epochs * steps_per_epoch
+        lr_for_optimizer = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=learning_rate,
+            decay_steps=total_decay_steps,
+            alpha=cosine_min_lr / learning_rate,
+        )
+        LOG.info("Phase MT: 6-channel S1 input (3 acquisitions x 2 polarisations); "
+                 "Phase B v2 loss family.")
     else:
         unet = build_unet(input_shape=(256, 256, 2), out_channels=6, base_channels=32)
 

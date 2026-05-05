@@ -55,3 +55,7 @@ oauth_token*
 # GEE / Earth Engine credential caches if they ever land in the tree.
 .earthengine/
 .config/earthengine/
+
+# One-off scratch dirs from the Welsh OOD experiment (Day 3 afternoon).
+# Canonical artefacts live in docs/images/ and training/WORKED_EXAMPLE_BERWYN.md.
+training/welsh_ood_work/

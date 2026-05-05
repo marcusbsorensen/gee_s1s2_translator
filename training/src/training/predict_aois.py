@@ -145,22 +145,38 @@ def _load_postfit_calibration() -> Tuple[np.ndarray, np.ndarray, str] | None:
     are length-6 arrays in S2_BANDS order, or None if no calibration file
     is bundled. Apply at inference as ``y_corrected = slope * y + intercept``
     on the 6 reflectance bands; recompute indices from the corrected bands.
+
+    Loader preference: v3 (multi-scene Huber fit on May-Aug 2024 paired
+    scenes across 4 sites) wins; v1 (single-scene LSQ fit on Cavenham
+    only) is left in the package as a historical artefact and only used
+    if v3 is missing. v3 has tightly-bounded slopes [0.74, 1.09] and
+    near-zero intercepts; v1 collapsed to constant on B11/B12 due to the
+    single-scene over-fit and is not recommended.
     """
-    cal_path = os.path.join(os.path.dirname(__file__),
-                            "calibration", "postfit_affine_v1.json")
-    if not os.path.exists(cal_path):
-        return None
-    try:
-        with open(cal_path) as f:
-            doc = json.load(f)
-    except Exception as e:
-        LOG.warning("Could not read calibration %s: %s", cal_path, e)
-        return None
-    bands_doc = doc.get("bands", {})
-    slopes = np.array([bands_doc[b]["slope"] for b in S2_BANDS], dtype=np.float32)
-    intercepts = np.array([bands_doc[b]["intercept"] for b in S2_BANDS], dtype=np.float32)
-    source = doc.get("fit_source", "unknown")
-    return slopes, intercepts, source
+    cal_dir = os.path.join(os.path.dirname(__file__), "calibration")
+    candidates = ["postfit_affine_v3.json", "postfit_affine_v1.json"]
+    for name in candidates:
+        cal_path = os.path.join(cal_dir, name)
+        if not os.path.exists(cal_path):
+            continue
+        try:
+            with open(cal_path) as f:
+                doc = json.load(f)
+        except Exception as e:
+            LOG.warning("Could not read calibration %s: %s", cal_path, e)
+            continue
+        # Schema: v3 keeps coefficients under "calibration"; v1 used "bands".
+        bands_doc = doc.get("calibration") or doc.get("bands") or {}
+        if not all(b in bands_doc for b in S2_BANDS):
+            LOG.warning("Calibration %s missing one of %s; trying next.",
+                        cal_path, S2_BANDS)
+            continue
+        slopes = np.array([bands_doc[b]["slope"] for b in S2_BANDS], dtype=np.float32)
+        intercepts = np.array([bands_doc[b]["intercept"] for b in S2_BANDS], dtype=np.float32)
+        source = doc.get("fit_source", name)
+        LOG.info("Using calibration %s (%s)", name, source)
+        return slopes, intercepts, source
+    return None
 
 
 def _compute_indices(s2_chw: np.ndarray) -> np.ndarray:
@@ -424,26 +440,55 @@ def main() -> int:
             except OSError:
                 pass
 
-    LOG.info("Loading U-Net from %s/unet.keras", model_prefix)
+    # Phase B was trained with output_activation="linear" (sigmoid removed,
+    # predictions clipped at inference). The default training run is
+    # sigmoid-output. Pick the right architecture before load_weights or
+    # the loaded weights will saturate through an unintended sigmoid.
+    output_activation = os.environ.get("GEE_S1S2_OUTPUT_ACTIVATION", "sigmoid").strip().lower() or "sigmoid"
+    if output_activation not in ("sigmoid", "linear"):
+        raise RuntimeError(f"Unsupported GEE_S1S2_OUTPUT_ACTIVATION={output_activation!r}")
+    LOG.info("Loading U-Net from %s/unet.keras (output_activation=%s)",
+             model_prefix, output_activation)
     unet = _load_full(f"{model_prefix}/unet.keras",
                       lambda: build_unet(input_shape=(256, 256, 2),
-                                         out_channels=6, base_channels=32))
-    LOG.info("Loading linear baseline from %s/linear_baseline.keras", model_prefix)
-    lb = _load_full(f"{model_prefix}/linear_baseline.keras",
-                    lambda: build_linear_baseline(input_shape=(256, 256, 2),
-                                                  out_channels=6))
+                                         out_channels=6, base_channels=32,
+                                         output_activation=output_activation))
+    # Linear baseline is optional. The Phase B v2 / B v3 runs don't fit a
+    # linear baseline, so loading it would fail on those checkpoints. Try
+    # to load and downgrade to None if the file isn't there.
+    lb_uri = f"{model_prefix}/linear_baseline.keras"
+    try:
+        if tf.io.gfile.exists(lb_uri):
+            LOG.info("Loading linear baseline from %s", lb_uri)
+            lb = _load_full(lb_uri,
+                            lambda: build_linear_baseline(input_shape=(256, 256, 2),
+                                                          out_channels=6))
+        else:
+            LOG.info("No linear_baseline.keras under %s; skipping linear baseline.",
+                     model_prefix)
+            lb = None
+    except Exception as e:
+        LOG.warning("Could not load linear baseline from %s (%s); skipping.", lb_uri, e)
+        lb = None
 
     # Optional per-band affine calibration (only applied to U-Net predictions;
     # the linear baseline has fundamentally different output statistics so the
     # U-Net-fitted calibration doesn't transfer).
-    calibration = _load_postfit_calibration()
+    # Bypass via GEE_S1S2_DISABLE_POSTFIT_CALIBRATION=true — used during the
+    # calibration-set inference pass so the fit isn't trained on its own output.
+    disable_cal = os.environ.get("GEE_S1S2_DISABLE_POSTFIT_CALIBRATION", "").strip().lower() in {"true", "1", "yes"}
+    if disable_cal:
+        LOG.info("GEE_S1S2_DISABLE_POSTFIT_CALIBRATION=true; running uncalibrated.")
+        calibration = None
+    else:
+        calibration = _load_postfit_calibration()
     if calibration is not None:
         cal_slope, cal_intercept, cal_source = calibration
         LOG.info("Loaded post-fit affine calibration from %s; will apply to U-Net.",
                  cal_source)
         for i, b in enumerate(S2_BANDS):
             LOG.info("  %s: slope=%.4f intercept=%.5f", b, cal_slope[i], cal_intercept[i])
-    else:
+    elif not disable_cal:
         LOG.info("No post-fit affine calibration found; U-Net output used as-is.")
 
     from google.cloud import storage
@@ -488,11 +533,22 @@ def main() -> int:
         s1_batch = np.stack([p[0] for p in per_patch], axis=0).astype(np.float32)
         LOG.info("  running U-Net inference on %d patches", len(per_patch))
         unet_preds = unet.predict(s1_batch, batch_size=8, verbose=0)
-        LOG.info("  running linear-baseline inference")
-        lb_preds = lb.predict(s1_batch, batch_size=8, verbose=0)
+        if lb is not None:
+            LOG.info("  running linear-baseline inference")
+            lb_preds = lb.predict(s1_batch, batch_size=8, verbose=0)
+        else:
+            lb_preds = None
+        # Phase B was trained with linear output; clip to operational [0,1]
+        # reflectance range here so downstream calibration + index recompute
+        # see in-range data. No-op for sigmoid-output runs.
+        if output_activation == "linear":
+            unet_preds = np.clip(unet_preds, 0.0, 1.0).astype(np.float32)
 
         # Mosaic each model's predictions into AOI-level GeoTIFF (9 bands).
-        for model_label, preds in [("unet", unet_preds), ("linear_baseline", lb_preds)]:
+        mosaic_pairs = [("unet", unet_preds)]
+        if lb_preds is not None:
+            mosaic_pairs.append(("linear_baseline", lb_preds))
+        for model_label, preds in mosaic_pairs:
             patch_data = []
             for i, (_s1, _s2, crs, transform) in enumerate(per_patch):
                 pred_chw = np.transpose(preds[i], (2, 0, 1))  # H,W,C -> C,H,W
@@ -553,19 +609,23 @@ def main() -> int:
                 unet_patch_data.append((_compute_indices(pred_chw), crs, transform))
             unet_mosaic, _, _ = _mosaic_patches(unet_patch_data)
 
-            lb_patch_data = []
-            for i, (_s1, _s2, crs, transform) in enumerate(per_patch):
-                pred_chw = np.transpose(lb_preds[i], (2, 0, 1))
-                lb_patch_data.append((_compute_indices(pred_chw), crs, transform))
-            lb_mosaic, _, _ = _mosaic_patches(lb_patch_data)
+            lb_mae = None
+            if lb_preds is not None:
+                lb_patch_data = []
+                for i, (_s1, _s2, crs, transform) in enumerate(per_patch):
+                    pred_chw = np.transpose(lb_preds[i], (2, 0, 1))
+                    lb_patch_data.append((_compute_indices(pred_chw), crs, transform))
+                lb_mosaic, _, _ = _mosaic_patches(lb_patch_data)
+                lb_mae = _per_band_mae(lb_mosaic, truth_mosaic)
 
             hankley_summary = {
                 "aoi": aoi,
                 "s1_date": s1_date,
                 "n_patches": len(per_patch),
                 "unet_per_band_mae": _per_band_mae(unet_mosaic, truth_mosaic),
-                "linear_baseline_per_band_mae": _per_band_mae(lb_mosaic, truth_mosaic),
             }
+            if lb_mae is not None:
+                hankley_summary["linear_baseline_per_band_mae"] = lb_mae
 
     if hankley_summary is not None:
         summary_uri = f"{pred_root}/hankley_sanity_mae.json"
@@ -574,8 +634,9 @@ def main() -> int:
         LOG.info("wrote %s", summary_uri)
         LOG.info("Hankley U-Net per-band MAE: %s",
                  json.dumps(hankley_summary["unet_per_band_mae"], indent=2))
-        LOG.info("Hankley linear-baseline per-band MAE: %s",
-                 json.dumps(hankley_summary["linear_baseline_per_band_mae"], indent=2))
+        if "linear_baseline_per_band_mae" in hankley_summary:
+            LOG.info("Hankley linear-baseline per-band MAE: %s",
+                     json.dumps(hankley_summary["linear_baseline_per_band_mae"], indent=2))
 
     LOG.info("Done.")
     return 0

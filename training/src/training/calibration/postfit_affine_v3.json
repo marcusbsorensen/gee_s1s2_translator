@@ -1,0 +1,104 @@
+{
+  "fit_method": "Huber regression, multi-scene pooled (epsilon=1.35)",
+  "fit_source": "calibration_set 6 paired scenes, May-Aug 2024 UK lowland heath",
+  "calibration_window": "2024-05-20 to 2024-08-23, UK lowland heath",
+  "n_scenes": 6,
+  "scene_list": [
+    {
+      "site": "Cavenham Heath",
+      "aoi_slug": "cavenham-heath",
+      "s1_date": "20240520"
+    },
+    {
+      "site": "Cavenham Heath",
+      "aoi_slug": "cavenham-heath",
+      "s1_date": "20240626"
+    },
+    {
+      "site": "Hankley Common",
+      "aoi_slug": "hankley-common",
+      "s1_date": "20240520"
+    },
+    {
+      "site": "Hankley Common",
+      "aoi_slug": "hankley-common",
+      "s1_date": "20240729"
+    },
+    {
+      "site": "Beaulieu Heath",
+      "aoi_slug": "beaulieu-heath",
+      "s1_date": "20240719"
+    },
+    {
+      "site": "Studland and Godlingston Heath",
+      "aoi_slug": "studland-and-godlingston-heath",
+      "s1_date": "20240719"
+    }
+  ],
+  "n_pixels_per_band": 673157,
+  "n_pixels_per_scene": [
+    {
+      "scene": "calibration_cavenham-heath_20240520",
+      "n": 116663
+    },
+    {
+      "scene": "calibration_cavenham-heath_20240626",
+      "n": 131152
+    },
+    {
+      "scene": "calibration_hankley-common_20240520",
+      "n": 97822
+    },
+    {
+      "scene": "calibration_hankley-common_20240729",
+      "n": 133640
+    },
+    {
+      "scene": "calibration_beaulieu-heath_20240719",
+      "n": 130340
+    },
+    {
+      "scene": "calibration_studland-and-godlingston-heath_20240719",
+      "n": 63540
+    }
+  ],
+  "schema": "y_corrected = slope * y_predicted + intercept (per band, [0,1] reflectance); indices NDVI/NBR/NDWI recomputed from corrected reflectance.",
+  "calibration": {
+    "B02": {
+      "slope": 0.7469423145932638,
+      "intercept": 0.00564189162561458,
+      "fit_rmse": 0.02441871352493763,
+      "fit_n_pixels": 673157
+    },
+    "B03": {
+      "slope": 0.7450580691496289,
+      "intercept": 0.011372598805952846,
+      "fit_rmse": 0.03203977271914482,
+      "fit_n_pixels": 673157
+    },
+    "B04": {
+      "slope": 1.0894854899271043,
+      "intercept": -0.007849671569240142,
+      "fit_rmse": 0.04331527277827263,
+      "fit_n_pixels": 673157
+    },
+    "B08": {
+      "slope": 0.9148473093710057,
+      "intercept": 0.005214107485475197,
+      "fit_rmse": 0.09725691378116608,
+      "fit_n_pixels": 673157
+    },
+    "B11": {
+      "slope": 0.9369950869201924,
+      "intercept": 0.01339210890639604,
+      "fit_rmse": 0.07439839094877243,
+      "fit_n_pixels": 673157
+    },
+    "B12": {
+      "slope": 1.0872680375629988,
+      "intercept": -0.002025485591558591,
+      "fit_rmse": 0.07236357033252716,
+      "fit_n_pixels": 673157
+    }
+  }
+}

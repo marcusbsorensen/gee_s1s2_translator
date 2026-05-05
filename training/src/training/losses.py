@@ -31,13 +31,20 @@ def combined_l1_l2_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
 
 
 class CombinedL1L2VarianceLoss(tf.keras.losses.Loss):
-    """L1 + 0.5*L2 + variance_weight * sum_b |std(y_pred_b) - std(y_true_b)|.
+    """L1 + 0.5*L2 + gate * sum_b w_b * |std(y_pred_b) - std(y_true_b)|.
 
     The variance term is computed per-batch (std taken across the batch +
-    spatial dims for each output channel). ``variance_weight`` is a
-    :class:`tf.Variable` so a callback can update it on epoch boundaries
-    without recompiling the model. Set it to 0.0 during the warmup epochs
-    and to the target weight afterwards.
+    spatial dims for each output channel). The ``variance_weight`` field
+    is a :class:`tf.Variable` used as a 0/1 warmup gate by
+    :class:`VarianceWeightWarmup` (set to 0.0 before the warmup epoch and
+    to the target weight afterwards), so the callback can ramp the term
+    in without recompiling the model.
+
+    Per-band weights ``w_b`` come from ``variance_band_weights`` (a
+    length-out_channels list). Phase B v2 used a uniform 0.3 across all
+    six bands; Phase B v3 uses an asymmetric vector that weights the
+    bands which did not respond to the v2 default (B04, B11, B12) more
+    heavily than the band that did (B08).
     """
 
     def __init__(
@@ -45,6 +52,7 @@ class CombinedL1L2VarianceLoss(tf.keras.losses.Loss):
         l1_weight: float = L1_WEIGHT,
         l2_weight: float = L2_WEIGHT,
         variance_weight: float = 0.0,
+        variance_band_weights: list[float] | None = None,
         name: str = "combined_l1_l2_variance",
     ) -> None:
         super().__init__(name=name)
@@ -56,6 +64,15 @@ class CombinedL1L2VarianceLoss(tf.keras.losses.Loss):
             dtype=tf.float32,
             name="variance_weight",
         )
+        if variance_band_weights is None:
+            self.variance_band_weights = None
+        else:
+            # Constant tensor; baked at construction time.
+            self.variance_band_weights = tf.constant(
+                [float(w) for w in variance_band_weights],
+                dtype=tf.float32,
+                name="variance_band_weights",
+            )
 
     def call(self, y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
         l1 = tf.reduce_mean(tf.abs(y_true - y_pred))
@@ -63,7 +80,11 @@ class CombinedL1L2VarianceLoss(tf.keras.losses.Loss):
         # Per-band std across (batch, H, W). Output shape: (C,).
         true_std = tf.math.reduce_std(tf.cast(y_true, tf.float32), axis=[0, 1, 2])
         pred_std = tf.math.reduce_std(tf.cast(y_pred, tf.float32), axis=[0, 1, 2])
-        var_term = tf.reduce_sum(tf.abs(true_std - pred_std))
+        per_band_diff = tf.abs(true_std - pred_std)
+        if self.variance_band_weights is not None:
+            var_term = tf.reduce_sum(self.variance_band_weights * per_band_diff)
+        else:
+            var_term = tf.reduce_sum(per_band_diff)
         return (self.l1_weight * l1
                 + self.l2_weight * l2
                 + self.variance_weight * var_term)
