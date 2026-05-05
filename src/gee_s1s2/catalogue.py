@@ -73,6 +73,7 @@ def s2_sr_collection(
     aoi: Any,                # ee.Geometry
     start: date,
     end: date,
+    cloud_cover_override_pct: float | None = None,
 ) -> Any:                    # ee.ImageCollection
     """Build a filtered Sentinel-2 SR_HARMONIZED ``ee.ImageCollection``.
 
@@ -81,10 +82,19 @@ def s2_sr_collection(
     coarse pre-filter (``< 1.5x`` the configured ``max_aoi_cloud_cover_percent``,
     matching v2's behaviour). Final per-AOI cloud filtering happens in
     :mod:`gee_s1s2.filtering` against the SCL band.
+
+    ``cloud_cover_override_pct`` lets a per-window override (e.g. the
+    inference ``post-fire 2022`` window) widen the tile-level prefilter
+    to admit cloudy scenes for the cloud-penetration use case.
     """
     import ee  # noqa: PLC0415
 
-    pre_filter_pct = float(cfg.max_aoi_cloud_cover_percent) * 1.5
+    cloud_basis = float(
+        cloud_cover_override_pct
+        if cloud_cover_override_pct is not None
+        else cfg.max_aoi_cloud_cover_percent
+    )
+    pre_filter_pct = cloud_basis * 1.5
     coll = (
         ee.ImageCollection(cfg.collection_id)
         .filterBounds(aoi)

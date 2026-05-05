@@ -31,9 +31,13 @@ from pathlib import Path
 
 LOG = logging.getLogger("post_fire_harvest")
 
-# AOIs and window we're restricting to.
-TARGET_AOIS = ["Brentmoor area training", "Poors Allotment area training"]
-TARGET_WINDOW = "post-fire 2022"
+# AOIs and window the worker will harvest. Defaults match the original
+# post-fire 2022 cloud-penetration target; override via env vars when the
+# script is reused for other AOI/window combinations:
+#   GEE_S1S2_TARGET_AOIS    — comma-separated AOI display names
+#   GEE_S1S2_TARGET_WINDOW  — date-window name from the operational config
+DEFAULT_TARGET_AOIS = ["Brentmoor area training", "Poors Allotment area training"]
+DEFAULT_TARGET_WINDOW = "post-fire 2022"
 
 # KML files we need on the worker. They live on GCS at this prefix and
 # the config will be patched to reference the local download paths.
@@ -139,19 +143,25 @@ def main() -> int:
     from .config import load_config
     config = load_config(patched_path)
 
+    # --- Resolve which AOIs and which window this run should target ---
+    aois_env = os.environ.get("GEE_S1S2_TARGET_AOIS")
+    if aois_env:
+        target_aois = [a.strip() for a in aois_env.split(",") if a.strip()]
+    else:
+        target_aois = list(DEFAULT_TARGET_AOIS)
+    target_window = os.environ.get("GEE_S1S2_TARGET_WINDOW", DEFAULT_TARGET_WINDOW)
+    LOG.info("Harvest targets: AOIs=%s window=%r", target_aois, target_window)
+
     # --- Run the filtered harvest ---
     from .harvest import run_harvest
-    LOG.info("Running harvest restricted to AOIs=%s window=%r ...",
-             TARGET_AOIS, TARGET_WINDOW)
 
-    summary = None
-    for aoi_name in TARGET_AOIS:
-        LOG.info("=== Harvest pass: AOI=%r window=%r ===", aoi_name, TARGET_WINDOW)
+    for aoi_name in target_aois:
+        LOG.info("=== Harvest pass: AOI=%r window=%r ===", aoi_name, target_window)
         s = run_harvest(
             config,
             dry_run=False,
             only_aoi=aoi_name,
-            only_window=TARGET_WINDOW,
+            only_window=target_window,
             include_inference_windows=True,
         )
         LOG.info("AOI %r summary: candidates=%d new_pairs=%d accepted_after_cloud=%d "
@@ -168,14 +178,17 @@ def main() -> int:
     poll_interval_s = 60
     timeout_s = 4 * 3600  # 4 h hard cap
     deadline = time.time() + timeout_s
+    # Window-derived slug used in GEE task descriptions, e.g.
+    # "post-fire 2022" -> "post-fire-2022".
+    window_slug = target_window.replace(" ", "-").lower()
     while True:
         # Filter task list to ones we recognise from this run (description
-        # prefix "gee_s1s2 " plus our window slug "post-fire-2022").
+        # prefix "gee_s1s2 " plus the active window slug).
         all_tasks = ee.data.getTaskList()
         ours = [
             t for t in all_tasks
             if t.get("description", "").startswith("gee_s1s2 ")
-            and "post-fire-2022" in t.get("description", "")
+            and window_slug in t.get("description", "")
         ]
         active = [t for t in ours if t.get("state") in ("READY", "RUNNING")]
         completed = [t for t in ours if t.get("state") == "COMPLETED"]

@@ -115,25 +115,47 @@ def train(
     checkpoint_uri: str,
     sidecar_uri: str,
     log_uri: str,
-    learning_rate: float = 1e-4,
+    learning_rate: float | tf.keras.optimizers.schedules.LearningRateSchedule = 1e-4,
     max_epochs: int = 80,
     early_stopping_patience: int = 15,
     extra_metadata: dict | None = None,
     resume: bool = True,
+    loss_fn=None,
+    extra_callbacks: list | None = None,
+    loss_label: str | None = None,
 ) -> TrainingResult:
     """Run training. Returns :class:`TrainingResult` with best-epoch metrics.
 
-    The model is compiled internally with Adam + combined L1+L2 loss + RMSE
+    The model is compiled internally with Adam + the configured loss + RMSE
     metric. Pass a fresh (uncompiled) :class:`tf.keras.Model`.
+
+    Args:
+        learning_rate: either a constant float or a Keras
+            :class:`LearningRateSchedule`. The Phase B run passes a
+            ``CosineDecay`` schedule; the default v2-equivalent run
+            passes a constant 1e-4.
+        loss_fn: callable or :class:`tf.keras.losses.Loss`. Defaults to
+            :func:`losses.combined_l1_l2_loss` (the v2 baseline).
+        extra_callbacks: appended to the standard callback list (early
+            stopping, GCS checkpoint, GCS logger). Phase B passes a
+            :class:`VarianceWeightWarmup` here.
+        loss_label: human-readable label written into the sidecar JSON.
+            Defaults to ``"L1 + 0.5 * L2"`` to preserve historic sidecar
+            content for the v2-equivalent run.
 
     If ``resume=True`` (default) and prior ``checkpoint_uri`` + ``sidecar_uri``
     exist on GCS, weights are loaded and training continues from the next
     epoch. Set ``resume=False`` to force a fresh run (e.g. after a code
     change to the model architecture).
     """
+    if loss_fn is None:
+        loss_fn = combined_l1_l2_loss
+    if loss_label is None:
+        loss_label = "L1 + 0.5 * L2"
+
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
-        loss=combined_l1_l2_loss,
+        loss=loss_fn,
         metrics=[
             tf.keras.metrics.MeanAbsoluteError(name="mae"),
             tf.keras.metrics.RootMeanSquaredError(name="rmse"),
@@ -199,6 +221,18 @@ def train(
     # killed mid-training (the post-fit final sidecar below never runs in
     # that case). Whole-file rewrites are fine — epoch counts are small.
 
+    # Sidecar-safe representation of the LR setting (a Schedule isn't
+    # JSON-serialisable, so record either the constant or the schedule's
+    # name + config).
+    if isinstance(learning_rate, tf.keras.optimizers.schedules.LearningRateSchedule):
+        try:
+            lr_for_sidecar = {"schedule": type(learning_rate).__name__,
+                              "config": learning_rate.get_config()}
+        except Exception:
+            lr_for_sidecar = {"schedule": type(learning_rate).__name__}
+    else:
+        lr_for_sidecar = float(learning_rate)
+
     class GcsLogger(tf.keras.callbacks.Callback):
         def on_epoch_end(self, epoch: int, logs: dict | None = None) -> None:
             row = {"epoch": epoch + 1, **(logs or {})}
@@ -219,10 +253,10 @@ def train(
                 "epochs_run": epoch + 1,
                 "trained_at": datetime.now(timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"),
-                "learning_rate": learning_rate,
+                "learning_rate": lr_for_sidecar,
                 "max_epochs": max_epochs,
                 "early_stopping_patience": early_stopping_patience,
-                "loss": "L1 + 0.5 * L2",
+                "loss": loss_label,
                 "model_name": model.name,
                 "extra": extra_metadata or {},
                 "_partial": True,
@@ -231,6 +265,9 @@ def train(
                 json.dump(partial, f, indent=2)
 
     callbacks.append(GcsLogger())
+
+    if extra_callbacks:
+        callbacks.extend(extra_callbacks)
 
     # Snapshot prior history before fit() appends to history_rows.
     prior_val_rmse = [float(r["val_rmse"]) for r in history_rows if "val_rmse" in r]
@@ -263,10 +300,10 @@ def train(
         "epochs_run": epochs_run,
         "training_seconds": elapsed_s,
         "trained_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "learning_rate": learning_rate,
+        "learning_rate": lr_for_sidecar,
         "max_epochs": max_epochs,
         "early_stopping_patience": early_stopping_patience,
-        "loss": "L1 + 0.5 * L2",
+        "loss": loss_label,
         "model_name": model.name,
         "extra": extra_metadata or {},
     }

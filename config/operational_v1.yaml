@@ -151,6 +151,38 @@ aois:
     role: target
     source: { type: point_buffer, latitude: 51.180, longitude: -0.730, buffer_metres: 1000 }
 
+  # =========================================================================
+  # OUT-OF-DISTRIBUTION WORKED EXAMPLE AOI
+  # ---------------------------------------------------------------------------
+  # Cavenham Heath SSSI / Cavenham Heath NNR, Suffolk Brecks. Genuinely
+  # different ecogeographic region from the southern-England training set
+  # (Surrey / Hampshire / Dorset / Sussex). On Sentinel-2 tile T31UCT (vs
+  # T30U* for the training AOIs). Used solely for the OPERATIONAL_DEPLOYMENT
+  # worked example showing model generalisation; not a training site.
+  # =========================================================================
+  - name: "Cavenham Heath"
+    role: training
+    source: { type: point_buffer, latitude: 52.291, longitude: 0.587, buffer_metres: 2000 }
+    force_split: test
+    sample: { strategy: random_patches, n_patches: 24, patch_size_pixels: 256, resolution_metres: 10 }
+
+  # ---------------------------------------------------------------------------
+  # Berwyn SSSI, north Wales. Welsh upland heath — a regionally and
+  # climatically distinct OOD test from the southern-England training set.
+  # Higher elevation (~400-700m), oceanic-margin climate with substantially
+  # higher annual rainfall, mixed heather + grass mosaic at this elevation.
+  # On Sentinel-2 tile T30UWC (different from training set's T30U*).
+  # Used solely for the second OPERATIONAL_DEPLOYMENT worked example
+  # extending the transfer claim across regional regimes; not a training
+  # site. AOI-level cloud cover 0.00% on 2024-06-02 (best Welsh-site
+  # cloud-free pair in the April-September 2024 window).
+  # =========================================================================
+  - name: "Berwyn SSSI"
+    role: training
+    source: { type: point_buffer, latitude: 52.95, longitude: -3.45, buffer_metres: 2000 }
+    force_split: test
+    sample: { strategy: random_patches, n_patches: 24, patch_size_pixels: 256, resolution_metres: 10 }
+
 date_windows:
   - { start: "2021-04-01", end: "2021-09-30", label: "pre-fire 2021" }
   - { start: "2022-04-01", end: "2022-08-15", label: "pre-fire 2022" }
@@ -164,7 +196,25 @@ date_windows:
   # = 100 makes the pipeline accept any S2 scene as the pairing target.
   - { start: "2022-08-20", end: "2022-11-30", label: "post-fire 2022", role: inference,
       cloud_cover_override_pct: 100 }
+  # Early post-fire 2022 — 1-2 week post-fire window for Brentmoor (~9 Aug
+  # ignition) and Poors Allotment (13 Aug ignition). Sonia's real-S2 dNBR
+  # for Brentmoor used 14 Aug 2022; this window gives the model the
+  # equivalent acquisition timing. Same cloud-cover override as post-fire
+  # 2022 since Aug 2022 was largely cloud-covered.
+  - { start: "2022-08-10", end: "2022-08-25", label: "early post-fire 2022", role: inference,
+      cloud_cover_override_pct: 100 }
   - { start: "2024-06-01", end: "2024-08-31", label: "sanity check 2024", role: inference }
+  # Calibration scene set — paired S1+S2 patches used solely to fit the
+  # post-fit affine calibration (see training/calibration/postfit_affine_v3.json).
+  # role: inference keeps these patches out of the train/val/test rotation.
+  - { start: "2024-09-01", end: "2024-11-30", label: "calibration autumn 2024", role: inference }
+  # Welsh upland heath OOD validation. Berwyn SSSI 2024-06-02 has AOI-level
+  # cloud cover 0.00% but tile-level cloud cover 14.10% (above the default
+  # 12% prefilter, which is 1.5x the operational max_aoi_cloud_cover_percent
+  # of 8%). Override widens the prefilter so the 2024-06-02 pair can be
+  # found by the harvest planner; per-patch cloud checks still apply.
+  - { start: "2024-06-01", end: "2024-06-04", label: "welsh validation 2024",
+      role: inference, cloud_cover_override_pct: 25 }
 
 sentinel2:
   source: gee_sr_harmonized
@@ -237,3 +287,12 @@ inference:
     # apply_to entries for any AOI regardless of role.
     - { aoi: "Brentmoor area training", date_window: "post-fire 2022" }
     - { aoi: "Poors Allotment area training", date_window: "post-fire 2022" }
+    # Early post-fire 2022 — 1-2 week post-fire window matching the
+    # acquisition timing of Sonia's real-S2 dNBR test (14 Aug 2022 for
+    # Brentmoor). Both AOIs because Poors ignited 13 Aug 2022.
+    - { aoi: "Brentmoor area training", date_window: "early post-fire 2022" }
+    - { aoi: "Poors Allotment area training", date_window: "early post-fire 2022" }
+    # Welsh upland heath OOD validation — Berwyn SSSI 2024-06-02. Second
+    # OOD demonstration extending the transfer claim from southern-England
+    # heath to north-Welsh upland heath.
+    - { aoi: "Berwyn SSSI", date_window: "welsh validation 2024" }

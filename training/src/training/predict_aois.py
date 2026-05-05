@@ -139,6 +139,46 @@ def _normalize_s1(s1: np.ndarray, stats: S1Stats) -> np.ndarray:
     return (s1 - mean) / std
 
 
+def _load_postfit_calibration() -> Tuple[np.ndarray, np.ndarray, str] | None:
+    """Load the per-band affine calibration shipped with the package, if
+    present. Returns (slope, intercept, source_label) where slope/intercept
+    are length-6 arrays in S2_BANDS order, or None if no calibration file
+    is bundled. Apply at inference as ``y_corrected = slope * y + intercept``
+    on the 6 reflectance bands; recompute indices from the corrected bands.
+
+    Loader preference: v3 (multi-scene Huber fit on May-Aug 2024 paired
+    scenes across 4 sites) wins; v1 (single-scene LSQ fit on Cavenham
+    only) is left in the package as a historical artefact and only used
+    if v3 is missing. v3 has tightly-bounded slopes [0.74, 1.09] and
+    near-zero intercepts; v1 collapsed to constant on B11/B12 due to the
+    single-scene over-fit and is not recommended.
+    """
+    cal_dir = os.path.join(os.path.dirname(__file__), "calibration")
+    candidates = ["postfit_affine_v3.json", "postfit_affine_v1.json"]
+    for name in candidates:
+        cal_path = os.path.join(cal_dir, name)
+        if not os.path.exists(cal_path):
+            continue
+        try:
+            with open(cal_path) as f:
+                doc = json.load(f)
+        except Exception as e:
+            LOG.warning("Could not read calibration %s: %s", cal_path, e)
+            continue
+        # Schema: v3 keeps coefficients under "calibration"; v1 used "bands".
+        bands_doc = doc.get("calibration") or doc.get("bands") or {}
+        if not all(b in bands_doc for b in S2_BANDS):
+            LOG.warning("Calibration %s missing one of %s; trying next.",
+                        cal_path, S2_BANDS)
+            continue
+        slopes = np.array([bands_doc[b]["slope"] for b in S2_BANDS], dtype=np.float32)
+        intercepts = np.array([bands_doc[b]["intercept"] for b in S2_BANDS], dtype=np.float32)
+        source = doc.get("fit_source", name)
+        LOG.info("Using calibration %s (%s)", name, source)
+        return slopes, intercepts, source
+    return None
+
+
 def _compute_indices(s2_chw: np.ndarray) -> np.ndarray:
     """Compute NDVI, NBR, NDWI from a 6-band (C,H,W) reflectance array.
 
@@ -157,29 +197,94 @@ def _compute_indices(s2_chw: np.ndarray) -> np.ndarray:
     return np.stack([B02, B03, B04, B08, B11, B12, NDVI, NBR, NDWI], axis=0).astype(np.float32)
 
 
-def _mosaic_patches(patch_data: List[Tuple[np.ndarray, str, Affine]]) -> Tuple[np.ndarray, Affine, str]:
-    """Mosaic per-patch (C,H,W) arrays into a single CHW raster using rasterio.
+def _cosine_taper_window(h: int, w: int, margin: int = 32) -> np.ndarray:
+    """Build a 2D cosine-tapered window of shape (h, w) with a Hann ramp
+    of width ``margin`` at each edge and weight 1.0 in the centre.
 
-    All patches share CRS (single UTM zone per AOI). The final transform is the
-    union extent's transform; pixels outside any patch are NaN.
+    Used by :func:`_mosaic_patches` to feather patch predictions at their
+    edges, so that overlapping patches are blended (weighted average)
+    rather than producing the hard seams that ``rasterio.merge`` (which
+    is "first non-NaN wins") leaves at every patch boundary.
     """
+    def _axis(n: int) -> np.ndarray:
+        x = np.ones(n, dtype=np.float32)
+        m = min(margin, n // 2)
+        # Left edge: 0 at i=0, 1 at i=m
+        for i in range(m):
+            x[i] = 0.5 * (1 - np.cos(np.pi * i / m))
+        # Right edge: mirror of the left edge
+        for i in range(m):
+            x[n - 1 - i] = 0.5 * (1 - np.cos(np.pi * i / m))
+        return x
+    wy = _axis(h)
+    wx = _axis(w)
+    return np.outer(wy, wx).astype(np.float32)
+
+
+def _mosaic_patches(
+    patch_data: List[Tuple[np.ndarray, str, Affine]],
+    taper_margin: int = 32,
+) -> Tuple[np.ndarray, Affine, str]:
+    """Cosine-blended mosaic of per-patch (C,H,W) arrays into a single
+    CHW raster.
+
+    For each patch we accumulate ``prediction * window`` into a
+    weighted-sum raster and ``window`` into a sum-of-weights raster at
+    the union extent. The final output is ``weighted_sum / weight_sum``,
+    NaN where no patch covered the pixel. This replaces the prior
+    ``rasterio.merge`` (method="first") implementation that produced
+    visible seams at patch boundaries (12-15x background-gradient,
+    measured on the Brentmoor + Poors post-fire 2022 outputs).
+
+    All patches must share the same CRS and pixel resolution.
+    """
+    if not patch_data:
+        raise ValueError("patch_data is empty")
     crs = patch_data[0][1]
-    datasets = []
+    res_x = patch_data[0][2].a
+    res_y = -patch_data[0][2].e  # rasterio's e is negative for north-up rasters
+
+    # Union extent in CRS coordinates.
+    minx = min(t[2].c for t in patch_data)
+    maxy = max(t[2].f for t in patch_data)
+    maxx = max(t[2].c + t[0].shape[2] * res_x for t in patch_data)
+    miny = min(t[2].f - t[0].shape[1] * res_y for t in patch_data)
+    union_w = int(round((maxx - minx) / res_x))
+    union_h = int(round((maxy - miny) / res_y))
+    union_transform = Affine(res_x, 0.0, minx, 0.0, -res_y, maxy)
+
+    n_channels = patch_data[0][0].shape[0]
+    weighted_sum = np.zeros((n_channels, union_h, union_w), dtype=np.float32)
+    weight_sum = np.zeros((union_h, union_w), dtype=np.float32)
+
     for arr, patch_crs, transform in patch_data:
         assert patch_crs == crs, f"CRS mismatch: {patch_crs} != {crs}"
         c, h, w = arr.shape
-        memfile = MemoryFile()
-        with memfile.open(
-            driver="GTiff", height=h, width=w, count=c,
-            dtype="float32", crs=crs, transform=transform, nodata=np.nan,
-        ) as ds:
-            ds.write(arr.astype(np.float32))
-        datasets.append(memfile.open())
+        col_off = int(round((transform.c - minx) / res_x))
+        row_off = int(round((maxy - transform.f) / res_y))
 
-    mosaic, mosaic_transform = merge(datasets, nodata=np.nan)
-    for ds in datasets:
-        ds.close()
-    return mosaic, mosaic_transform, crs
+        win = _cosine_taper_window(h, w, margin=taper_margin)
+        # Zero out the window where any band is NaN so we don't pull
+        # nodata into the weighted sum.
+        finite_all = np.isfinite(arr).all(axis=0)
+        eff_win = win * finite_all.astype(np.float32)
+
+        # Replace NaN with 0 in arr for the multiplication; the eff_win
+        # mask already excludes those pixels from weight accumulation.
+        arr_clean = np.where(np.isfinite(arr), arr, 0.0).astype(np.float32)
+
+        weighted_sum[:, row_off:row_off + h, col_off:col_off + w] += (
+            arr_clean * eff_win[None, :, :]
+        )
+        weight_sum[row_off:row_off + h, col_off:col_off + w] += eff_win
+
+    out = np.full_like(weighted_sum, np.nan)
+    valid = weight_sum > 0
+    for ci in range(n_channels):
+        ch = out[ci]
+        ws = weighted_sum[ci]
+        ch[valid] = ws[valid] / weight_sum[valid]
+    return out, union_transform, crs
 
 
 def _write_geotiff(uri: str, data_chw: np.ndarray, transform: Affine, crs: str,
@@ -202,6 +307,78 @@ def _write_geotiff(uri: str, data_chw: np.ndarray, transform: Affine, crs: str,
         size = os.path.getsize(local_path)
         tf.io.gfile.copy(local_path, uri, overwrite=True)
         return size
+    finally:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+
+
+def _write_preview_png(
+    mosaic: np.ndarray,
+    transform: Affine,
+    crs: str,
+    out_uri: str,
+    title: str = "",
+) -> None:
+    """Render a 3-panel preview PNG (RGB / false-colour / NBR) and upload to ``out_uri``.
+
+    Panels:
+      1. RGB composite (B04 R, B03 G, B02 B), explicit stretch [0, 0.3].
+      2. False-colour (B08 R, B04 G, B03 B), explicit stretch [0, 0.5].
+      3. NBR (band 8 of the mosaic), diverging RdYlGn_r, stretch [-0.5, 0.5].
+
+    Layout is side-by-side at 150 dpi. Coordinates use the mosaic's
+    transform so axes are CRS-true.
+    """
+    # Lazy import so a matplotlib failure doesn't abort GeoTIFF writes.
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib import pyplot as plt
+
+    if mosaic.shape[0] < 9:
+        raise ValueError(f"preview expects 9-band mosaic, got {mosaic.shape[0]}")
+    b02, b03, b04, b08, _b11, _b12 = mosaic[0], mosaic[1], mosaic[2], mosaic[3], mosaic[4], mosaic[5]
+    nbr = mosaic[7]
+
+    h, w = b04.shape
+    extent = (transform.c, transform.c + w * transform.a,
+              transform.f + h * transform.e, transform.f)  # left, right, bottom, top
+    valid = np.isfinite(b04)
+
+    def _stretch(arr: np.ndarray, vmax: float, gamma: float = 0.7) -> np.ndarray:
+        return np.clip(arr / vmax, 0.0, 1.0) ** gamma
+
+    rgb = np.dstack([_stretch(b04, 0.3), _stretch(b03, 0.3), _stretch(b02, 0.3)])
+    fc = np.dstack([_stretch(b08, 0.5), _stretch(b04, 0.5), _stretch(b03, 0.5)])
+    rgb[~valid] = 1.0
+    fc[~valid] = 1.0
+    nbr_for_plot = np.where(valid, nbr, np.nan)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6.5), dpi=150)
+    axes[0].imshow(rgb, extent=extent, origin="upper")
+    axes[0].set_title("RGB (B04/B03/B02), stretch [0, 0.3]", fontsize=10)
+    axes[1].imshow(fc, extent=extent, origin="upper")
+    axes[1].set_title("False-colour (B08/B04/B03), stretch [0, 0.5]", fontsize=10)
+    im = axes[2].imshow(nbr_for_plot, extent=extent, origin="upper",
+                        cmap="RdYlGn_r", vmin=-0.5, vmax=0.5)
+    axes[2].set_title("NBR (B08-B12)/(B08+B12)", fontsize=10)
+    fig.colorbar(im, ax=axes[2], fraction=0.04, pad=0.04, shrink=0.85)
+    for ax in axes:
+        ax.set_xlabel("easting (m)")
+        ax.set_ylabel("northing (m)")
+        ax.tick_params(axis="both", labelsize=7)
+        ax.set_aspect("equal")
+    if title:
+        fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+
+    with tempfile.NamedTemporaryFile(suffix="_preview.png", delete=False) as tmp:
+        local_path = tmp.name
+    try:
+        fig.savefig(local_path, bbox_inches="tight")
+        plt.close(fig)
+        tf.io.gfile.copy(local_path, out_uri, overwrite=True)
     finally:
         try:
             os.remove(local_path)
@@ -263,14 +440,56 @@ def main() -> int:
             except OSError:
                 pass
 
-    LOG.info("Loading U-Net from %s/unet.keras", model_prefix)
+    # Phase B was trained with output_activation="linear" (sigmoid removed,
+    # predictions clipped at inference). The default training run is
+    # sigmoid-output. Pick the right architecture before load_weights or
+    # the loaded weights will saturate through an unintended sigmoid.
+    output_activation = os.environ.get("GEE_S1S2_OUTPUT_ACTIVATION", "sigmoid").strip().lower() or "sigmoid"
+    if output_activation not in ("sigmoid", "linear"):
+        raise RuntimeError(f"Unsupported GEE_S1S2_OUTPUT_ACTIVATION={output_activation!r}")
+    LOG.info("Loading U-Net from %s/unet.keras (output_activation=%s)",
+             model_prefix, output_activation)
     unet = _load_full(f"{model_prefix}/unet.keras",
                       lambda: build_unet(input_shape=(256, 256, 2),
-                                         out_channels=6, base_channels=32))
-    LOG.info("Loading linear baseline from %s/linear_baseline.keras", model_prefix)
-    lb = _load_full(f"{model_prefix}/linear_baseline.keras",
-                    lambda: build_linear_baseline(input_shape=(256, 256, 2),
-                                                  out_channels=6))
+                                         out_channels=6, base_channels=32,
+                                         output_activation=output_activation))
+    # Linear baseline is optional. The Phase B v2 / B v3 runs don't fit a
+    # linear baseline, so loading it would fail on those checkpoints. Try
+    # to load and downgrade to None if the file isn't there.
+    lb_uri = f"{model_prefix}/linear_baseline.keras"
+    try:
+        if tf.io.gfile.exists(lb_uri):
+            LOG.info("Loading linear baseline from %s", lb_uri)
+            lb = _load_full(lb_uri,
+                            lambda: build_linear_baseline(input_shape=(256, 256, 2),
+                                                          out_channels=6))
+        else:
+            LOG.info("No linear_baseline.keras under %s; skipping linear baseline.",
+                     model_prefix)
+            lb = None
+    except Exception as e:
+        LOG.warning("Could not load linear baseline from %s (%s); skipping.", lb_uri, e)
+        lb = None
+
+    # Optional per-band affine calibration (only applied to U-Net predictions;
+    # the linear baseline has fundamentally different output statistics so the
+    # U-Net-fitted calibration doesn't transfer).
+    # Bypass via GEE_S1S2_DISABLE_POSTFIT_CALIBRATION=true — used during the
+    # calibration-set inference pass so the fit isn't trained on its own output.
+    disable_cal = os.environ.get("GEE_S1S2_DISABLE_POSTFIT_CALIBRATION", "").strip().lower() in {"true", "1", "yes"}
+    if disable_cal:
+        LOG.info("GEE_S1S2_DISABLE_POSTFIT_CALIBRATION=true; running uncalibrated.")
+        calibration = None
+    else:
+        calibration = _load_postfit_calibration()
+    if calibration is not None:
+        cal_slope, cal_intercept, cal_source = calibration
+        LOG.info("Loaded post-fit affine calibration from %s; will apply to U-Net.",
+                 cal_source)
+        for i, b in enumerate(S2_BANDS):
+            LOG.info("  %s: slope=%.4f intercept=%.5f", b, cal_slope[i], cal_intercept[i])
+    elif not disable_cal:
+        LOG.info("No post-fit affine calibration found; U-Net output used as-is.")
 
     from google.cloud import storage
     sclient = storage.Client(project=project_id)
@@ -314,14 +533,33 @@ def main() -> int:
         s1_batch = np.stack([p[0] for p in per_patch], axis=0).astype(np.float32)
         LOG.info("  running U-Net inference on %d patches", len(per_patch))
         unet_preds = unet.predict(s1_batch, batch_size=8, verbose=0)
-        LOG.info("  running linear-baseline inference")
-        lb_preds = lb.predict(s1_batch, batch_size=8, verbose=0)
+        if lb is not None:
+            LOG.info("  running linear-baseline inference")
+            lb_preds = lb.predict(s1_batch, batch_size=8, verbose=0)
+        else:
+            lb_preds = None
+        # Phase B was trained with linear output; clip to operational [0,1]
+        # reflectance range here so downstream calibration + index recompute
+        # see in-range data. No-op for sigmoid-output runs.
+        if output_activation == "linear":
+            unet_preds = np.clip(unet_preds, 0.0, 1.0).astype(np.float32)
 
         # Mosaic each model's predictions into AOI-level GeoTIFF (9 bands).
-        for model_label, preds in [("unet", unet_preds), ("linear_baseline", lb_preds)]:
+        mosaic_pairs = [("unet", unet_preds)]
+        if lb_preds is not None:
+            mosaic_pairs.append(("linear_baseline", lb_preds))
+        for model_label, preds in mosaic_pairs:
             patch_data = []
             for i, (_s1, _s2, crs, transform) in enumerate(per_patch):
                 pred_chw = np.transpose(preds[i], (2, 0, 1))  # H,W,C -> C,H,W
+                # Apply per-band affine calibration to U-Net reflectance only.
+                # The calibration was fit on Cavenham U-Net predicted-vs-truth
+                # and corrects systematic dark bias + variance compression on
+                # visible bands; applying to the linear baseline (different
+                # output statistics) would be incorrect, so we skip it there.
+                if model_label == "unet" and calibration is not None:
+                    pred_chw = pred_chw * cal_slope[:, None, None] + cal_intercept[:, None, None]
+                    pred_chw = np.clip(pred_chw, 0.0, 1.0).astype(np.float32)
                 full = _compute_indices(pred_chw)
                 patch_data.append((full, crs, transform))
             mosaic, mtrans, mcrs = _mosaic_patches(patch_data)
@@ -330,6 +568,14 @@ def main() -> int:
                    else f"{pred_root}/{model_label}/{label}_predicted_s2.tif")
             size = _write_geotiff(uri, mosaic, mtrans, mcrs, out_band_names)
             LOG.info("  wrote %s (%d B)", uri, size)
+            # Sidecar PNG preview (RGB + false-colour + NBR) for fast visual QA.
+            try:
+                preview_uri = uri.replace(".tif", "_preview.png")
+                _write_preview_png(mosaic, mtrans, mcrs, preview_uri,
+                                   title=f"{label} ({model_label})")
+                LOG.info("  wrote %s", preview_uri)
+            except Exception as e:
+                LOG.warning("  preview render failed for %s: %s", uri, e)
 
         # Hankley: also write truth and compute per-band MAE.
         if tgt["save_truth"]:
@@ -344,27 +590,42 @@ def main() -> int:
                          else f"{pred_root}/truth/{label}_truth_s2.tif")
             tsize = _write_geotiff(truth_uri, truth_mosaic, t_trans, t_crs, out_band_names)
             LOG.info("  wrote %s (%d B)", truth_uri, tsize)
+            try:
+                _write_preview_png(truth_mosaic, t_trans, t_crs,
+                                   truth_uri.replace(".tif", "_preview.png"),
+                                   title=f"{label} (truth)")
+            except Exception as e:
+                LOG.warning("  truth preview render failed: %s", e)
 
             # Compute MAE between U-Net prediction mosaic and truth mosaic.
+            # Apply the same per-band calibration we shipped on the saved
+            # GeoTIFF so the MAE compares the corrected prediction to truth.
             unet_patch_data = []
             for i, (_s1, _s2, crs, transform) in enumerate(per_patch):
                 pred_chw = np.transpose(unet_preds[i], (2, 0, 1))
+                if calibration is not None:
+                    pred_chw = pred_chw * cal_slope[:, None, None] + cal_intercept[:, None, None]
+                    pred_chw = np.clip(pred_chw, 0.0, 1.0).astype(np.float32)
                 unet_patch_data.append((_compute_indices(pred_chw), crs, transform))
             unet_mosaic, _, _ = _mosaic_patches(unet_patch_data)
 
-            lb_patch_data = []
-            for i, (_s1, _s2, crs, transform) in enumerate(per_patch):
-                pred_chw = np.transpose(lb_preds[i], (2, 0, 1))
-                lb_patch_data.append((_compute_indices(pred_chw), crs, transform))
-            lb_mosaic, _, _ = _mosaic_patches(lb_patch_data)
+            lb_mae = None
+            if lb_preds is not None:
+                lb_patch_data = []
+                for i, (_s1, _s2, crs, transform) in enumerate(per_patch):
+                    pred_chw = np.transpose(lb_preds[i], (2, 0, 1))
+                    lb_patch_data.append((_compute_indices(pred_chw), crs, transform))
+                lb_mosaic, _, _ = _mosaic_patches(lb_patch_data)
+                lb_mae = _per_band_mae(lb_mosaic, truth_mosaic)
 
             hankley_summary = {
                 "aoi": aoi,
                 "s1_date": s1_date,
                 "n_patches": len(per_patch),
                 "unet_per_band_mae": _per_band_mae(unet_mosaic, truth_mosaic),
-                "linear_baseline_per_band_mae": _per_band_mae(lb_mosaic, truth_mosaic),
             }
+            if lb_mae is not None:
+                hankley_summary["linear_baseline_per_band_mae"] = lb_mae
 
     if hankley_summary is not None:
         summary_uri = f"{pred_root}/hankley_sanity_mae.json"
@@ -373,8 +634,9 @@ def main() -> int:
         LOG.info("wrote %s", summary_uri)
         LOG.info("Hankley U-Net per-band MAE: %s",
                  json.dumps(hankley_summary["unet_per_band_mae"], indent=2))
-        LOG.info("Hankley linear-baseline per-band MAE: %s",
-                 json.dumps(hankley_summary["linear_baseline_per_band_mae"], indent=2))
+        if "linear_baseline_per_band_mae" in hankley_summary:
+            LOG.info("Hankley linear-baseline per-band MAE: %s",
+                     json.dumps(hankley_summary["linear_baseline_per_band_mae"], indent=2))
 
     LOG.info("Done.")
     return 0

@@ -143,7 +143,10 @@ def run_harvest(
 
             LOG.info("Harvest AOI=%r window=%r", aoi.name, window.label)
             try:
-                s2_coll = s2_sr_collection(config.sentinel2, geom_ee, window.start, window.end)
+                s2_coll = s2_sr_collection(
+                    config.sentinel2, geom_ee, window.start, window.end,
+                    cloud_cover_override_pct=window.cloud_cover_override_pct,
+                )
                 s1_raw = s1_grd_collection(config.sentinel1, geom_ee, window.start, window.end)
                 s1_coll = calibrate_grd_collection(
                     s1_raw, config.calibration, config.sentinel1.polarisations,

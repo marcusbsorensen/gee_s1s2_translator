@@ -193,6 +193,12 @@ def cmd_harvest(
         None, "--window",
         help="Restrict harvest to one date window (used with --aoi).",
     ),
+    include_inference: bool = typer.Option(
+        False, "--include-inference",
+        help="Also harvest windows with role: inference (e.g. post-fire 2022, "
+             "early post-fire 2022). Off by default to keep training-window "
+             "harvests focused.",
+    ),
     verbose: bool = typer.Option(False, "--verbose"),
 ) -> None:
     """Run the harvest. Exports to GCS in normal mode, no exports in dry-run."""
@@ -213,6 +219,7 @@ def cmd_harvest(
 
     summary = harvest.run_harvest(
         cfg, dry_run=dry_run, only_aoi=aoi, only_window=window,
+        include_inference_windows=include_inference,
     )
 
     table = Table(title=("Harvest summary (dry-run)" if dry_run else "Harvest summary"))
