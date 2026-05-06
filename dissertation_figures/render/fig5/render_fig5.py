@@ -54,6 +54,22 @@ def stretch_fixed(arr, lo=0.0, hi=0.3):
     return np.clip((arr - lo) / (hi - lo), 0, 1)
 
 
+def stretch_adaptive(arr, valid_mask, p_lo: float = 2.0, p_hi: float = 98.0):
+    """Per-array p2-p98 stretch over jointly-valid pixels.
+
+    Returns (stretched_array, lo, hi) so the caller can put the actual
+    reflectance bracket in the panel caption.
+    """
+    v = arr[valid_mask]
+    if v.size == 0:
+        return np.zeros_like(arr), 0.0, 1.0
+    lo = float(np.percentile(v, p_lo))
+    hi = float(np.percentile(v, p_hi))
+    if hi <= lo:
+        return np.clip(arr, 0, 1), lo, max(lo + 1e-6, hi)
+    return np.clip((arr - lo) / (hi - lo), 0, 1), lo, hi
+
+
 def load_local(path: str) -> str:
     return path
 
@@ -96,6 +112,7 @@ def driver_var_retention(truth_path: str, pred_path: str) -> float | None:
 
 
 def render_rgb(path):
+    """Identical [0, 0.3] stretch — for the cross-variant comparison row."""
     with rasterio.open(path) as ds:
         b02 = ds.read(BAND_IDX["B02"]).astype(np.float32)
         b03 = ds.read(BAND_IDX["B03"]).astype(np.float32)
@@ -104,6 +121,40 @@ def render_rgb(path):
     rgb = np.dstack([stretch_fixed(b04), stretch_fixed(b03), stretch_fixed(b02)])
     rgb[~valid] = 1.0
     return rgb
+
+
+def render_rgb_adaptive(path):
+    """Per-panel p2-p98 stretch — for the variant-fairness row.
+
+    Per-band stretch: each band gets its own [p2, p98] computed over
+    valid pixels. This reveals spatial structure within each band's
+    actual distribution — important for Phase B v3, whose RGB-band
+    means are clustered around 0.4-0.55 but each band still has
+    spatial variance around its own mean. A joint stretch would
+    collapse that structure into uniform colour because B04's mean
+    sits near the joint p98 ceiling.
+
+    Multi-temporal v1's outlier pixels render as bright tints under
+    per-band stretching (because outliers in different bands occur
+    at different pixel locations); the caption notes this honestly
+    and points the viewer to row 1 for the unfiltered view.
+
+    Returns (rgb, lo, hi) where [lo, hi] is the joint min/max of the
+    three per-band brackets — a single bracket the caption can show.
+    """
+    with rasterio.open(path) as ds:
+        b02 = ds.read(BAND_IDX["B02"]).astype(np.float32)
+        b03 = ds.read(BAND_IDX["B03"]).astype(np.float32)
+        b04 = ds.read(BAND_IDX["B04"]).astype(np.float32)
+    valid = np.isfinite(b02) & np.isfinite(b03) & np.isfinite(b04) & ((b02+b03+b04) > 0)
+    s02, lo02, hi02 = stretch_adaptive(b02, valid)
+    s03, lo03, hi03 = stretch_adaptive(b03, valid)
+    s04, lo04, hi04 = stretch_adaptive(b04, valid)
+    rgb = np.dstack([s04, s03, s02])
+    rgb[~valid] = 1.0
+    lo = min(lo02, lo03, lo04)
+    hi = max(hi02, hi03, hi04)
+    return rgb, lo, hi
 
 
 S2_BANDS = ["B02", "B03", "B04", "B08", "B11", "B12"]
@@ -127,41 +178,89 @@ def main():
         if cap.startswith("A —"):
             truth_path = p
 
-    # Per-panel caption — keep short to fit small panels. Honest about
-    # the visual character: baseline + B v2 land in collapsed territory;
-    # B v3 saturates white (model means 0.4-0.55 land above the [0, 0.3]
-    # ceiling); MT overshoots variance with extreme pixel outliers.
-    captions = []
+    # Per-panel captions for both rows
+    row1_captions = []  # cross-variant comparison [0, 0.3]
+    row2_captions = []  # variant fairness, p2-p98
+    retention_by_run: dict = {}
     for cap, run, p in resolved:
+        letter = cap.split(" — ")[0]
+        short = cap.split(" — ")[1].split(" (")[0] if " — " in cap else cap
         if cap.startswith("A —"):
-            captions.append("A — truth Sentinel-2\n(reference reflectance)")
+            row1_captions.append("A — truth Sentinel-2\n(reference reflectance)")
         else:
             r = driver_var_retention(truth_path, p)
-            short = cap.split(" — ")[1].split(" (")[0] if " — " in cap else cap
-            letter = cap.split(" — ")[0]
-            captions.append(f"{letter} — {short}\ndriver var retention {r:.0f}%")
+            retention_by_run[run] = r
+            row1_captions.append(f"{letter} — {short}\ndriver var retention {r:.0f}%")
             print(f"{cap}: driver var retention = {r:.1f}%")
 
-    fig, axes = plt.subplots(1, 5, figsize=(22, 5.6),
-                             gridspec_kw={"wspace": 0.04, "left": 0.01, "right": 0.99,
-                                          "top": 0.84, "bottom": 0.10})
-    for ax, (cap, run, path), title in zip(axes, resolved, captions):
+    # Row 2 stretch brackets — pre-compute and build captions
+    row2_brackets = {}
+    for cap, run, p in resolved:
+        _, lo, hi = render_rgb_adaptive(p)
+        row2_brackets[cap] = (lo, hi)
+        letter = cap.split(" — ")[0]
+        short = cap.split(" — ")[1].split(" (")[0] if " — " in cap else cap
+        if cap.startswith("A —"):
+            row2_captions.append(f"A — truth Sentinel-2\nstretch [{lo:.2f}, {hi:.2f}]")
+        elif run == "multitemporal_v1_t4":
+            row2_captions.append(
+                f"{letter} — {short}\nstretch [{lo:.2f}, {hi:.2f}] — extreme pixel outliers clipped\n(visible in row 1)")
+        else:
+            row2_captions.append(f"{letter} — {short}\nstretch [{lo:.2f}, {hi:.2f}]")
+
+    fig, axes = plt.subplots(2, 5, figsize=(22, 12.0),
+                             gridspec_kw={"wspace": 0.04, "hspace": 0.30,
+                                          "left": 0.01, "right": 0.99,
+                                          "top": 0.91, "bottom": 0.13})
+
+    # Row 1: identical [0, 0.3] stretch
+    for ax, (cap, run, path), title in zip(axes[0], resolved, row1_captions):
         ax.imshow(render_rgb(path))
         ax.set_title(title, fontsize=10)
         ax.axis("off")
+
+    # Row 2: per-panel p2-p98 stretch
+    for ax, (cap, run, path), title in zip(axes[1], resolved, row2_captions):
+        rgb, _, _ = render_rgb_adaptive(path)
+        ax.imshow(rgb)
+        ax.set_title(title, fontsize=10)
+        ax.axis("off")
+
+    # Row headers (positioned just above each row's panels)
+    fig.text(0.5, 0.93, "Identical [0, 0.3] stretch — cross-variant comparison",
+             ha="center", fontsize=11, fontweight="bold")
+    fig.text(0.5, 0.485, "Per-panel p2 to p98 stretch — each variant on its own terms",
+             ha="center", fontsize=11, fontweight="bold")
+
     fig.suptitle(
         "Figure 5 — The shape of variance retention across improvement attempts (Cavenham 26-Jun-2024)",
-        fontsize=12, y=0.97,
+        fontsize=13, y=0.99,
     )
-    fig.text(0.5, 0.04,
-             "Identical RGB stretch [0, 0.3]. Truth (A) is sharp; baseline+v3 (B) and Phase B v2 (C) land in similar variance-collapsed territory; "
-             "Phase B v3 (D) saturates white because its raw outputs on this OOD scene land in 0.4-0.55 reflectance (v3 calibration was fit on baseline);\n"
-             "Multi-temporal v1 (E) shows variance overshooting with extreme pixel outliers. The four interventions fail at variance retention in three distinct ways.",
+    fig.text(0.5, 0.954,
+             "Top row: identical [0, 0.3] stretch reveals where each variant's distribution lands relative to truth's (the cross-variant fairness view). "
+             "Bottom row: per-panel adaptive stretch reveals what each variant actually produces when rendered on its own terms (the variant-fairness view). "
+             "Both views are honest; they answer different questions.",
              ha="center", fontsize=9.5, style="italic", color="#333")
+
+    bottom_caption = (
+        "The four interventions fail at variance retention in three distinct ways. "
+        "Variance collapse (baseline + v3, Phase B v2) produces smooth low-contrast outputs that respect truth's mean but compress its variance. "
+        "Off-distribution mean (Phase B v3) shifts the predicted reflectance regime above the [0, 0.3] stretch ceiling because v3 calibration was fit on baseline outputs and does not transfer;\n"
+        "row 2 reveals that Phase B v3 does produce structured spatial output, just at a different mean. "
+        "Variance overshoot with outliers (multi-temporal v1) produces extreme pixel values that survive calibration; row 2 reveals that the underlying spatial structure is plausible when outliers are clipped. "
+        "None of the four interventions matches truth's joint distribution of mean and variance,\n"
+        "supporting the dissertation's central methodological finding that variance retention is bounded by dataset scale at this data volume."
+    )
+    fig.text(0.5, 0.012, bottom_caption,
+             ha="center", va="bottom", fontsize=9, style="italic", color="#333")
+
     out = WORK / "figure_5_variance_retention_attempts.png"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     print(f"\nwrote {out}")
+    print(f"\nrow 2 brackets:")
+    for cap, (lo, hi) in row2_brackets.items():
+        print(f"  {cap}: [{lo:.4f}, {hi:.4f}]")
 
 
 if __name__ == "__main__":

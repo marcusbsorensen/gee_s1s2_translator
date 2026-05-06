@@ -130,29 +130,51 @@ different from variance overshooting, and a model trained with
 variance-loss generalises worse than baseline at the most extreme
 OOD point.
 
-Five panels, all Cavenham Heath 26-Jun-2024, identical RGB stretch
-[0, 0.3], identical band mapping, identical projection extent:
+**Layout: 2 rows × 5 columns**, all Cavenham Heath 26-Jun-2024.
+Both rows answer different questions about the same predictions.
+
+- **Row 1 — identical [0, 0.3] stretch (cross-variant comparison
+  view).** Same RGB stretch on every panel, so each variant's
+  distribution lands relative to truth's. This is where you see
+  the cross-variant fairness story:
+  baseline+v3 (41 %) and Phase B v2 (50 %) sit in collapsed-but-
+  credible territory; **Phase B v3 saturates white** (its model
+  outputs on this OOD scene land in 0.4-0.55 reflectance, above
+  the stretch ceiling — v3 affine was fit on baseline and does
+  not transfer); **Multi-temporal v1 shows variance overshoot
+  with extreme pixel outliers** (81 % retention but visible as
+  bright magenta/blue blobs).
+
+- **Row 2 — per-panel p2-p98 stretch (variant-fairness view).**
+  Each panel uses its own reflectance distribution to set the
+  stretch, so the spatial structure each variant produces is
+  visible. Captions show the actual stretch bracket. Phase B v3
+  reveals that it **does** produce structured spatial output —
+  just at a different mean (stretch [0.38, 0.55]). Multi-temporal
+  v1's underlying landscape texture is visible; the brightest
+  outliers retain some tint because they peak in different
+  locations across bands.
+
+Per-panel summary (driver-band variance retention from row 1
+metric, on jointly-valid pixels of the Cavenham prediction):
 
 - **Panel A — truth Sentinel-2:** sharp landscape with field
-  boundaries clearly visible. Reference reflectance.
+  boundaries clearly visible. Reference reflectance. Row 2 stretch
+  [0.01, 0.22].
 - **Panel B — baseline + v3 calibration:** smoothed, low-contrast.
-  Driver-band variance retention **41 %** on Cavenham. Variance-
-  collapsed but credible reflectance distribution.
+  Driver var retention **41 %**. Row 2 stretch [0.02, 0.08].
 - **Panel C — Phase B v2** (variance-aware loss): similar to B with
-  isolated variance-overshoot patches in the lower-mid region.
-  Driver var retention **50 %**.
-- **Panel D — Phase B v3** (band-weighted variance): saturates white
-  across most of the AOI. The raw model output on this OOD scene
-  lands in the 0.4-0.55 reflectance range, well above the [0, 0.3]
-  stretch ceiling. The v3 affine calibration was fit on baseline
-  outputs and does not transfer to B v3's distribution. Driver var
-  retention **14 %** (heavy collapse around an off-distribution mean).
-- **Panel E — Multi-temporal v1:** variance overshooting at
-  driver-band retention **81 %** (closest to truth on this metric)
-  but with extreme pixel outliers visible as bright magenta/blue
-  blobs throughout. The linear-output multi-temporal model produces
-  values that overshoot the realistic reflectance range; v3
-  calibration cannot fix the overshoot.
+  isolated variance-overshoot patches. Driver var retention **50 %**.
+  Row 2 stretch [0.00, 0.08].
+- **Panel D — Phase B v3** (band-weighted variance): row 1 saturates
+  white because raw outputs land at 0.4-0.55. Row 2 stretch
+  [0.38, 0.55] reveals real spatial structure under the
+  off-distribution mean. Driver var retention **14 %** — a heavy
+  collapse around an off-distribution mean.
+- **Panel E — Multi-temporal v1:** row 1 shows variance overshoot
+  with extreme outliers. Driver var retention **81 %** (closest to
+  truth on the std-ratio metric). Row 2 stretch [0.00, 0.16] —
+  most outliers clipped, underlying spatial structure plausible.
 
 **Three failure modes from four interventions:**
 
