@@ -145,15 +145,25 @@ Both rows answer different questions about the same predictions.
   with extreme pixel outliers** (81 % retention but visible as
   bright magenta/blue blobs).
 
-- **Row 2 — per-panel p2-p98 stretch (variant-fairness view).**
-  Each panel uses its own reflectance distribution to set the
-  stretch, so the spatial structure each variant produces is
-  visible. Captions show the actual stretch bracket. Phase B v3
+- **Row 2 — per-panel per-band p2-p98 stretch (variant-fairness view).**
+  Each panel's RGB bands each get their own [p2, p98] computed over
+  valid pixels; the caption reports the joint [min p2, max p98]
+  bracket as a summary. This reveals the spatial structure each
+  variant produces on its own reflectance distribution. Phase B v3
   reveals that it **does** produce structured spatial output —
-  just at a different mean (stretch [0.38, 0.55]). Multi-temporal
-  v1's underlying landscape texture is visible; the brightest
-  outliers retain some tint because they peak in different
-  locations across bands.
+  just at a different mean (joint bracket ~[0.38, 0.55]). Multi-
+  temporal v1's underlying landscape texture is visible; the
+  brightest outliers retain some colour tint where outlier peaks
+  are misaligned across bands.
+
+  *Note on alternatives explored:* a wider joint stretch
+  ([0, 0.55] then [0, 0.6]) was tested to give all five panels a
+  single shared rendering bracket. Both rendered Phase B v3 as a
+  flat pink panel — its R/G/B band means cluster too tightly
+  (B02/B03 ~0.39, B04 ~0.55) for any wide joint stretch to reveal
+  its spatial structure. Per-band p2-p98 is the best honest
+  trade-off at this scene; multi-temporal v1's residual outlier
+  tints are an acknowledged cost.
 
 Per-panel summary (driver-band variance retention from row 1
 metric, on jointly-valid pixels of the Cavenham prediction):
